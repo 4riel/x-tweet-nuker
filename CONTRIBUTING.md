@@ -26,6 +26,14 @@ There is a test suite, and it is fast and offline:
 npm test        # node --test test/*.test.js
 ```
 
+## Continuous integration
+
+[`.github/workflows/test.yml`](.github/workflows/test.yml) runs `npm test` on every push to `main`
+and every pull request, across the matrix Node 20 / 22 / latest × Ubuntu / macOS / Windows. It
+needs nothing beyond `npm ci` first — no browser, no real X account, no secrets — because the
+suite itself is fully offline (see [Testing a change](#testing-a-change) below). A PR that breaks
+any cell of that matrix will show it before review.
+
 ## Where things live
 
 | File | Responsibility |
@@ -36,8 +44,8 @@ npm test        # node --test test/*.test.js
 | `src/client.js` | the browser-free GraphQL client (delete, unretweet, timeline paging) |
 | `src/archive.js` | parses `tweets.js` from an X data archive |
 | `src/state.js` | resumable run state (`.nuke-state.json`) and its advisory `.lock` file |
-| `src/confirm.js` | the type-your-handle confirmation gate |
-| `src/context.js` | shared setup (logger, session, client) for the commands that talk to X |
+| `src/confirm.js` | the type-your-handle confirmation gate — fences `deleteTweet`/`unretweet` on the client itself, so a command cannot reach them before the gate is armed |
+| `src/context.js` | shared setup (logger, session, client) for the commands that talk to X, plus identity verification (`resolveTargetHandle`) against what X says the session signs in as |
 | `src/logger.js` | timestamped console + file logging |
 | `src/errors.js` | `UserError` / `SessionExpiredError` and their exit codes |
 | `src/commands/verify.js` | independent browser-based proof the account is empty (see below) |
@@ -68,15 +76,40 @@ you hit this:
    (the last-resort default) also deserves an update.
 4. Open a PR describing what changed and how you found it.
 
+If you're not fixing it yourself, [the bug report template](.github/ISSUE_TEMPLATE/bug_report.yml)
+collects exactly what's needed to diagnose this class of issue (operation names seen, node/OS
+version, whether the session was freshly captured) — and reminds reporters never to paste the
+session file, `.env`, or any cookie/token value, since those are credential-equivalent. If what
+you've found is a way the session file itself could leak or be mishandled, that's a security
+report, not a bug report — see [SECURITY.md](SECURITY.md) for private disclosure instead of a
+public issue.
+
 ## Testing a change
 
 `npm test` runs the whole suite with Node's built-in test runner — no framework, no network, no
-browser, no real X account, and nothing written outside `os.tmpdir()`. It covers argument parsing
-and help/parser agreement (`test/cli.test.js`), configuration precedence and numeric validation
-(`test/config.test.js`), archive parsing (`test/archive.test.js`), the run-state file and its lock
-(`test/state.test.js`), the GraphQL client's success/gone/error/rate-limit handling against canned
-responses (`test/client.test.js`, via `test/helpers/fake-fetch.js`), and `verify`'s page reader and
-per-tab verdict against a scripted DOM (`test/verify.test.js`, via `test/helpers/fake-dom.js`).
+browser, no real X account, and nothing written outside `os.tmpdir()`. The suite's own test names
+are a good index of what behavior is actually guaranteed; broadly, it covers:
+
+- argument parsing and help/parser agreement (`test/cli.test.js`)
+- configuration precedence and numeric validation (`test/config.test.js`)
+- archive parsing, including the streaming JSON scanner (`test/archive.test.js`)
+- the run-state file, its lock, and real-signal interrupt handling — SIGINT/SIGTERM/SIGHUP/
+  SIGBREAK flushing progress before exit (`test/state.test.js`)
+- the GraphQL client's success/gone/error/rate-limit handling against canned responses
+  (`test/client.test.js`, via `test/helpers/fake-fetch.js`)
+- the destructive-methods confirmation gate — that `deleteTweet`/`unretweet` structurally cannot
+  fire before it is armed, on any client not fenced by it (`test/confirm.test.js`)
+- identity verification — a claimed `--handle` checked against what X says the session signs in
+  as, and the unverified fallback when X can't be reached (`test/context.test.js`)
+- `login`'s and `verify`'s shared `PROFILE_TABS` list (`test/session.test.js`)
+- the sweep harvest loop against canned timeline pages (`test/harvest.test.js`)
+- command-level integration — confirmation banners, dry runs, `--limit` exit codes, progress
+  logging, retweet handling (`test/commands.test.js`)
+- log formatting, the recent-window rate figure, and a log path that can't be created failing as
+  an actionable error (`test/logger.test.js`)
+- `verify`'s page reader and per-tab verdict, including the `COULD NOT CHECK` (unavailable
+  profile) case, against a scripted DOM (`test/verify.test.js`, via `test/helpers/fake-dom.js`)
+
 Add tests with a change; the suite is expected to stay green and to grow.
 
 What the suite **cannot** cover is x.com's real behaviour: whether a selector still matches, an

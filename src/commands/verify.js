@@ -20,12 +20,15 @@
 const { createRunContext } = require("../context");
 const { UserError, SessionExpiredError } = require("../errors");
 const { USER_AGENT } = require("../client");
+const { PROFILE_TABS } = require("../session");
 
 /**
- * Every profile tab that can render your own posts. Reposts is its own tab now, and a repost
- * left behind is exactly the kind of thing a "your account is empty" verdict must not miss.
+ * Every profile tab that can render your own posts - the same list `login` visits to capture the
+ * timeline requests `sweep` pages through, deliberately imported rather than repeated. Checking a
+ * tab the sweep never captured would report NOT CLEAN forever and send the user to a sweep that
+ * cannot clear it; see PROFILE_TABS in src/session.js.
  */
-const TABS = ["", "/with_replies", "/media", "/highlights", "/reposts"];
+const TABS = PROFILE_TABS;
 
 /**
  * Last-resort wording check, used only when neither structural signal below is present. X
@@ -33,7 +36,17 @@ const TABS = ["", "/with_replies", "/media", "/highlights", "/reposts"];
  * rather than quietly resolved into either answer.
  */
 const EMPTY_STATE =
-  /(hasn.t posted|haven.t posted|hasn.t replied|haven.t replied|hasn.t highlighted|haven.t highlighted|no posts yet|nothing to see here|doesn.t exist|does not exist|account is suspended|these posts are protected|owner limits who can view)/i;
+  /(hasn.t posted|haven.t posted|hasn.t replied|haven.t replied|hasn.t highlighted|haven.t highlighted|no posts yet|nothing to see here)/i;
+
+/**
+ * X's own words for "this profile is not being shown to you": suspended, protected, or no such
+ * account. These used to sit in EMPTY_STATE, which made a suspended account - an account that
+ * still holds every post it ever made, merely hidden - come back as CLEAN. Hidden is not empty,
+ * and none of these is evidence about what the account contains, so they get their own verdict
+ * that can never resolve to CLEAN.
+ */
+const UNAVAILABLE_STATE =
+  /(account is suspended|account suspended|these posts are protected|owner limits who can view|doesn.t exist|does not exist)/i;
 
 /** X renders this while a timeline failed to load - which is not the same as it being empty. */
 const LOAD_FAILURE = /something went wrong|try again|retry/i;
@@ -150,7 +163,7 @@ function readPage(name) {
  *
  * @param {ReturnType<typeof readPage>} info what the page reported
  * @param {{loadFailed?: boolean}} [options] pass `loadFailed` to override the text-based check
- * @returns {"stillThere"|"confirmedEmpty"|"unconfirmed"}
+ * @returns {"stillThere"|"unavailable"|"confirmedEmpty"|"unconfirmed"}
  */
 function classifyTab(info, options = {}) {
   const text = String((info && info.text) || "");
@@ -167,6 +180,10 @@ function classifyTab(info, options = {}) {
     return "stillThere";
   }
 
+  // A profile X is refusing to show renders nothing, exactly like an empty one. The difference is
+  // that everything is probably still there, so this can never become CLEAN.
+  if (UNAVAILABLE_STATE.test(text)) return "unavailable";
+
   const provenEmpty =
     !loadFailed &&
     (info.emptyStateMarker ||
@@ -176,7 +193,7 @@ function classifyTab(info, options = {}) {
   return provenEmpty ? "confirmedEmpty" : "unconfirmed";
 }
 
-async function run(config, options = {}) {
+async function run(config) {
   // The session file is the single source of truth for who this run is: it is what the deleter
   // authenticates with, so it is what the independent check has to authenticate with too.
   const ctx = createRunContext(config);
@@ -192,6 +209,21 @@ async function run(config, options = {}) {
   }
 
   const handle = config.handle || session.handle || (probe.ok ? probe.handle : null);
+  // Checking someone else's profile is a legitimate use of --handle, so this is a warning rather
+  // than a refusal - but a CLEAN verdict about a profile that is not the one being emptied is
+  // worthless as reassurance, and it must not be presented as if it were.
+  const sameAccount = Boolean(probe.ok && probe.handle && handle && handle.toLowerCase() === probe.handle.toLowerCase());
+  if (probe.ok && probe.handle && handle && !sameAccount) {
+    logger.warn(
+      "Checking @" +
+        handle +
+        ", which is NOT the account this session signs in as (@" +
+        probe.handle +
+        "). Whatever this reports says nothing about @" +
+        probe.handle +
+        "."
+    );
+  }
   if (!handle) {
     throw new UserError(
       "Do not know which profile to check.",
@@ -216,13 +248,14 @@ async function run(config, options = {}) {
     );
   }
 
-  const ids = String(options.ids || config.ids || "")
+  const ids = String(config.ids || "")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
 
   let stillThere = 0;
   const unconfirmed = [];
+  const unavailable = [];
   const confirmedEmpty = [];
 
   try {
@@ -266,6 +299,7 @@ async function run(config, options = {}) {
       });
 
       if (verdict === "stillThere") stillThere++;
+      else if (verdict === "unavailable") unavailable.push(label);
       else if (verdict === "confirmedEmpty") confirmedEmpty.push(label);
       else unconfirmed.push(label);
     }
@@ -281,6 +315,15 @@ async function run(config, options = {}) {
     logger.plain("");
     return 1;
   }
+  if (unavailable.length > 0) {
+    logger.plain("  COULD NOT CHECK - X is not showing this profile on " + unavailable.join(", ") + ".");
+    logger.plain("  It reported the account as suspended, protected, or non-existent. A profile that");
+    logger.plain("  is hidden is not a profile that is empty: the posts are most likely all still");
+    logger.plain("  there, just not being served. This is never reported as CLEAN. Check");
+    logger.plain("  https://x.com/" + handle + " while signed in as that account.");
+    logger.plain("");
+    return 1;
+  }
   if (unconfirmed.length > 0) {
     logger.plain("  COULD NOT CONFIRM - nothing was rendered on " + unconfirmed.join(", ") + ", but X");
     logger.plain("  never confirmed those timelines are empty, and zero cards on a page is not the");
@@ -292,7 +335,11 @@ async function run(config, options = {}) {
     return 1;
   }
   logger.plain("  CLEAN - every profile tab of @" + handle + " reported itself empty, checked while");
-  logger.plain("  signed in as the same account the deleter uses.");
+  logger.plain(
+    sameAccount
+      ? "  signed in as the same account the deleter uses."
+      : "  signed in - but as a DIFFERENT account, so this says nothing about the one the deleter empties."
+  );
   logger.plain("  Tabs confirmed empty: " + confirmedEmpty.join(", ") + ".");
   logger.plain("  The post counter in the profile header is cached and can stay wrong for days;");
   logger.plain("  check x.com/search?q=from%3A" + handle + "&f=live if you want a third opinion.");
@@ -369,9 +416,11 @@ module.exports = {
   description: "Open your profile in a browser and prove it is empty",
   readPage,
   classifyTab,
+  TABS,
   sessionCookies,
   requireSignedIn,
   EMPTY_STATE,
+  UNAVAILABLE_STATE,
   MISSING_POST,
   LOAD_FAILURE,
 };

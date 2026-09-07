@@ -11,6 +11,7 @@ clone is what makes the bare `x-tweet-nuker` name available.
 
 - [Commands](#commands)
 - [Global flags](#global-flags)
+- [Confirmation and identity verification](#confirmation-and-identity-verification)
 - [`login`](#login)
 - [`run`](#run)
 - [`nuke`](#nuke)
@@ -56,6 +57,32 @@ Any boolean flag can be turned off explicitly with `--no-<flag>` (e.g. `--no-hea
 prefix on anything that is not a boolean flag is rejected rather than silently ignored. `--yes`
 also accepts `-y`.
 
+## Confirmation and identity verification
+
+`nuke`, `sweep` and `run` all refuse to delete anything until the operator types the target handle
+back at a prompt (or `--yes` is passed deliberately). This is enforced on the destructive client
+calls themselves — `deleteTweet` and `unretweet` throw until the confirmation has actually run —
+not just at the top of a command, so there is no path through the code (a retry, an early
+`continue`, a future refactor) that reaches a deletion without asking first.
+
+The handle shown on that confirmation banner is checked against what X itself says the signed-in
+session belongs to:
+
+- If `--handle` (or `X_HANDLE`) names an account, and X can be reached, and X says the session
+  signs in as someone else — the run is refused outright, naming both accounts. The alternative
+  (trusting `--handle` and quietly emptying whichever account the session actually belongs to)
+  is exactly the kind of mislabelling a confirmation prompt exists to prevent.
+- If nothing was reachable to check against (X's identity endpoint is down, moved, or the network
+  is unreachable), the run is **not** blocked — but the banner prints `!! UNVERIFIED` next to the
+  handle, along with the numeric user id the deletion actually targets, so it's visible that the
+  name on screen is unconfirmed rather than silently trusted.
+- If no handle is known at all and X can't be reached to supply one, the run refuses — it will not
+  delete from an account it cannot name even provisionally.
+
+`--handle` given to `login` behaves differently: it is only a fallback used when the browser's own
+signed-in handle can't be detected, and it can never override a successfully detected handle. See
+[`login`](#login).
+
 ## `login`
 
 Opens a browser, waits for you to sign in, and saves the session. Never deletes anything, and is
@@ -70,11 +97,17 @@ login to complete.
 
 Sign-in happens in a persistent browser profile under `.chrome-user-data/`, so a later `login`
 usually does not ask for credentials again. While the browser is open, the tool visits your
-Replies, Posts, Media, Highlights and Reposts tabs to capture the timeline GraphQL requests the
-sweep later replays, and scrapes the current `DeleteTweet` / `UnretweetTweet` `queryId` values out
-of X's own JS bundles. Every one of those tabs has to be visited: several of them (Highlights,
-Reposts) fire their timeline request only while you are standing on them, and a timeline `login`
-never captured is a timeline `sweep` can never clear.
+Replies, Posts, Media, Highlights and Reposts tabs (in that order) to capture the timeline GraphQL
+requests the sweep later replays, and scrapes the current `DeleteTweet` / `UnretweetTweet`
+`queryId` values out of X's own JS bundles. Every one of those tabs has to be visited: several of
+them (Highlights, Reposts) fire their timeline request only while you are standing on them, and a
+timeline `login` never captured is a timeline `sweep` can never clear.
+
+The handle is read from the signed-in page itself (the profile link in the app's own nav bar), not
+from `--handle` or `X_HANDLE`. Those are only a **fallback** used when that detection genuinely
+fails — and if you give one that disagrees with the handle actually detected, `login` refuses
+outright rather than saving a session mislabelled with an account it cannot delete from. If
+detection fails and nothing was given to fall back on, `login` errors and asks for `--handle`.
 
 ## `run`
 
@@ -89,6 +122,12 @@ no archive it warns and goes straight to the sweep.
 | `--max-rounds <n>` | give up sweeping after N rounds (default 30, minimum 1) |
 | `--delay <ms>` | pause between deletions (default 400) |
 | `--yes`, `-y` | skip the typed confirmation (for automation) |
+
+One confirmation covers both passes — `run` asks once, and neither the archive pass nor the sweep
+asks again. `--limit` applies separately to each pass; if either pass stops early because of it,
+`run` prints `NOT finished` instead of `Done.` and exits non-zero. `run` never claims "Done." on a
+`--limit`-ed pass, on a sweep that didn't reach a clean round, or on an archive pass with unresolved
+failures — see [Exit codes](#exit-codes).
 
 ## `nuke`
 
@@ -107,7 +146,14 @@ hand.
 
 `--archive` accepts the `tweets.js` file itself or a directory containing `tweets.js` /
 `tweets-part*.js` (an unzipped archive's `data/` folder). A plain JSON array of id strings is
-accepted too, so you can feed in your own id list.
+accepted too, so you can feed in your own id list — including a subset of ids, if what you want is
+to delete some specific tweets rather than everything (there's no built-in filtering by date,
+content or engagement; a hand-picked id list is the only way to be selective).
+
+Progress is logged every 50 deletions as `Progress <done>/<total> {"deleted":…,"gone":…,
+"failed":…,"remaining":…,"perMinute":…}` — `remaining` is what's left in this pass, `perMinute` is
+the delete rate over roughly the last five minutes, not a lifetime average. There's no ETA; see
+[the note in `sweep`](#sweep) below for why.
 
 ## `sweep`
 
@@ -127,18 +173,35 @@ Deletion on X is eventually consistent — a tweet can still be served on a time
 after a successful delete — so one empty-looking pass is not treated as proof. A round that finds
 nothing *and* had timeline requests fail does not count as clean either; it waits and retries
 instead, because a pass that could not read your timelines found nothing only because it looked at
-nothing.
+nothing. The same applies if a timeline hit the 200-page pagination cap while still handing out
+cursors (`Stopped paging <timeline> at the 200-page cap…`) — that pass didn't reach the end of the
+timeline, so it can't count as clean either, and a round can exit non-zero having found zero posts
+for this reason alone.
+
+Within a round, progress is logged every 50 deletions as `Round N progress <done>/<total>
+{"deleted":…,"gone":…,"failed":…,"unretweeted":…,"remaining":…,"perMinute":…}`, and the round ends
+with `Round N deleted <count> {...}`. `remaining` is what's left in *this round* (a later round can
+still find more), and `perMinute` is measured over roughly the last five minutes, not a lifetime
+average. There's deliberately **no ETA** anywhere in this tool's output: X's rate limiting is
+bimodal — full speed, then a wall of up to 20 minutes — so any time-remaining figure would be
+wrong by an order of magnitude exactly when someone stops to read it.
+
+`--limit` makes a sweep stop after N deletions in the current round even though posts are still on
+the timeline. That's reported as `STOPPED EARLY` and the run exits `1` — the account is
+deliberately *not* claimed to be empty, unlike a normal clean sweep, which exits `0`.
 
 A `--dry-run` here reports one pass only, so the final total of a real sweep is usually higher
 than what the dry run shows.
 
 ## `verify`
 
-Opens a real browser and checks every profile tab that can render your posts — Posts, Replies,
-Media, Highlights and Reposts — and, optionally, specific tweet ids. This is a check independent
-of the deleter's own bookkeeping. It counts not just your own post cards but reposts too (a repost
-renders under the *original* author's link, so it needs its own check), plus any rendered post
-card that doesn't match a recognized "nothing here" empty state. Deletes nothing.
+Opens a real browser and checks every profile tab that can render your posts — Replies, Posts,
+Media, Highlights and Reposts, in that order (the same tabs, and the same order, that `login`
+visits to capture them; see [`PROFILE_TABS`](HOW-IT-WORKS.md#1-session-capture-login-srcsessionjs))
+— and, optionally, specific tweet ids. This is a check independent of the deleter's own
+bookkeeping. It counts not just your own post cards but reposts too (a repost renders under the
+*original* author's link, so it needs its own check), plus any rendered post card that doesn't
+match a recognized "nothing here" empty state. Deletes nothing.
 
 | Flag | Description |
 |---|---|
@@ -158,8 +221,14 @@ For the same reason, a tab with zero rendered post cards is not, by itself, trea
 anything — it only counts as empty when X's own page says so (an explicit empty-state element, the
 profile's timeline region rendering with recognizably zero cards inside it, or a recognized
 "hasn't posted" wording). A page that looks like it failed to load ("Something went wrong", "Try
-again") is explicitly never accepted as proof either way. That gives three possible verdicts, not
-two — see [Exit codes](#exit-codes).
+again") is explicitly never accepted as proof either way.
+
+A profile X refuses to show at all — suspended, protected (and you don't follow it), or
+non-existent — is its own, fourth verdict: `COULD NOT CHECK`, exit `1`, never `CLEAN`. X's
+"account is suspended" and "these posts are protected" wording used to fall into the same bucket
+as a genuinely empty timeline, which meant a suspended account (every post still there, just
+hidden from view) could be reported CLEAN. Hidden is not the same claim as empty, so that verdict
+can never resolve to CLEAN — see [Exit codes](#exit-codes) for all four.
 
 ## `status`
 
@@ -178,7 +247,7 @@ always wins over the defaults below.
 
 | Variable | Description | Default |
 |---|---|---|
-| `X_HANDLE` | your X handle, without `@` (normally auto-detected) | detected from session |
+| `X_HANDLE` | your X handle, without `@`. For `nuke`/`sweep`/`run`/`verify`, only meaningful when the session's own handle is unknown, and only as an **unverified** label — a mismatch with what X reports is refused, not overridden (see [Confirmation and identity verification](#confirmation-and-identity-verification)). For `login`, only a **fallback** used when detecting the signed-in handle fails; it cannot override a successfully detected handle | detected automatically |
 | `X_NUKER_DATA_DIR` | directory for session, state, logs and browser profile | current directory |
 | `ARCHIVE_FILE` | path to `tweets.js` (or a directory containing it) | `<data dir>/tweets.js` |
 | `SESSION_FILE` | explicit path to the session file | `<data dir>/.x-session-data.json` |
@@ -206,13 +275,19 @@ happened without parsing log output:
 | Code | Meaning |
 |---|---|
 | `0` | Clean: the archive/sweep pass fully succeeded, or every one of `verify`'s tabs (and ids) came back positively proven empty |
-| `1` | Not clean, or a user error, or unconfirmed: some deletions failed, a sweep ran out of rounds, `verify` found something still visible, `verify` could not get positive proof a tab is empty (`COULD NOT CONFIRM`), or an invalid flag/missing archive/lock conflict was rejected before anything ran |
+| `1` | Not clean, or a user error, or unconfirmed: some deletions failed, a sweep ran out of rounds (including a round that hit the 200-page pagination cap and so found zero posts without proving the timeline empty), a run stopped early on purpose because of `--limit` (`STOPPED EARLY`, with posts/ids still outstanding), `verify` found something still visible (`NOT CLEAN`), `verify` could not reach a profile at all (`COULD NOT CHECK` — suspended, protected, or nonexistent), `verify` could not get positive proof a tab is empty (`COULD NOT CONFIRM`), or an invalid flag/missing archive/lock conflict was rejected before anything ran |
 | `2` | Session expired (HTTP 401/403) — run `login` again; progress is saved, so a retry resumes where it stopped |
 
+`--limit <n>` set larger than what's actually left is not "early" — the pass genuinely finishes
+everything there was to do, and that still exits `0`. `STOPPED EARLY` (exit `1`) only happens when
+`--limit` was reached with work still outstanding.
+
 > [!NOTE]
-> `verify`'s `COULD NOT CONFIRM` verdict (exit `1`) means exactly what it says: it is not "not
-> clean", it is "the tool would not stake a CLEAN verdict on what it saw". Treat it the same as
-> "not clean" for scripting purposes — don't proceed as if the account were confirmed empty.
+> `verify`'s `COULD NOT CONFIRM` and `COULD NOT CHECK` verdicts (both exit `1`) mean exactly what
+> they say: neither is "not clean" in the `NOT CLEAN` sense, but neither is a green light either —
+> the tool would not stake a `CLEAN` verdict on what it saw (`COULD NOT CONFIRM`), or couldn't see
+> the profile at all (`COULD NOT CHECK`). Treat both the same as "not clean" for scripting
+> purposes — don't proceed as if the account were confirmed empty.
 
 `login` and `status` have no "not clean" verdict of their own — neither deletes anything or
 claims an account is empty — so they return `0` whenever they complete. They still use the same
@@ -228,16 +303,38 @@ actually still failing. If a run is interrupted for any reason — a rate limit,
 killing the process under memory pressure — just run the same command again. Already-deleted and
 already-confirmed-gone ids are skipped automatically; nothing extra to pass.
 
+### What Ctrl-C actually guarantees
+
+`nuke` and `sweep` install real handlers for `SIGINT` (Ctrl-C), `SIGTERM`, `SIGHUP` (the console
+window closing), and `SIGBREAK` (Ctrl-Break on Windows). On any of those, the run flushes every
+tweet id it has already resolved to `.nuke-state.json` and releases the lock file before exiting —
+so re-running the same command afterwards resumes with essentially nothing lost. Precisely: at most
+the single deletion that was in flight at the moment of the signal goes unrecorded, and even that
+is harmless, because X reports an already-deleted tweet as "not found" the next time it's tried,
+and that's read as `gone`, not as an error. Only a kill the process cannot intercept at all —
+`SIGKILL`, an out-of-memory kill, a power loss — falls back to the last throttled save, which is at
+most 5 seconds of deletions behind.
+
+### The lock file
+
 `nuke` and `sweep` (and therefore `run`) hold an advisory lock file, `<state file>.lock`, for as
 long as they are writing to that state file, so two runs can't share one data directory and
-silently overwrite each other's progress. The lock is released automatically when the process
-exits, including on Ctrl-C. If a run was killed hard enough to leave the lock behind, the next run
-on the same machine detects that the recorded process id is no longer running and takes the lock
-over on its own — no manual cleanup needed. You only need to intervene if you are certain no other
-run is using that data directory and the lock is still refused (for example, a lock left by a
-different machine sharing a network drive, which is trusted for up to 90 minutes of silence before
-it's treated as stale): delete `<state file>.lock` yourself, or point at a separate `--data-dir`
-for a genuinely parallel run.
+silently overwrite each other's progress. The lock is released automatically on a normal exit and
+on the interrupt handling described above. If a run was killed hard enough to leave the lock
+behind, the next run detects that on its own:
+
+- **On the same machine**, a lock whose process id is no longer running is stale immediately —
+  taken over with a logged warning, no manual cleanup needed.
+- **On any machine, same host or not**, a lock that has gone quiet — no save touching it — for more
+  than 90 minutes is *also* treated as stale, even if its process id happens to belong to some
+  other, unrelated live process. Process ids get reused by the OS, so a live pid alone is evidence,
+  not proof; 90 minutes is chosen to comfortably outlast the longest legitimate silence a real run
+  can have (a request stuck through the full escalating rate-limit backoff, worst case a bit over an
+  hour).
+
+You only need to intervene by hand if you're certain no other run is using that data directory and
+the lock is still refused inside that 90-minute window: delete `<state file>.lock` yourself, or
+point at a separate `--data-dir` for a genuinely parallel run.
 
 ```bash
 node bin/cli.js run --yes
@@ -300,9 +397,12 @@ That is very likely X's rate limit, not a hang. The tool logs
 `--verbose` or check the log file to see it. It trusts X's own `x-rate-limit-reset` header only
 while that time is still in the future; once it isn't (or there is no header), it backs off on its
 own, doubling from 60 seconds up to a 15-minute cap. Either way, a single wait is capped at 20
-minutes. If the same request gets rate limited 8 times in a row, the tool gives up on it with an
-explicit error instead of waiting indefinitely — re-run the same command later (progress is
-saved), or raise `--delay` if it's happening immediately on every request.
+minutes. Any wait longer than about a minute also prints
+`Still waiting out the rate limit - about N minute(s) left before the next attempt` roughly once a
+minute, specifically so a 20-minute wait doesn't look identical to a hang. If the same request gets
+rate limited 8 times in a row, the tool gives up on it with an explicit error instead of waiting
+indefinitely — re-run the same command later (progress is saved), or raise `--delay` if it's
+happening immediately on every request.
 </details>
 
 <details>
@@ -310,8 +410,31 @@ saved), or raise `--delay` if it's happening immediately on every request.
 
 `nuke`/`sweep`/`run` refuse to share one data directory with another run, to stop them from
 overwriting each other's progress. If that's genuinely a stale lock — the machine that created it
-crashed or was force-killed — delete the `.lock` file named in the error and try again, or use a
-different `--data-dir` for a deliberately parallel run.
+crashed or was force-killed, or it just hasn't been touched in over 90 minutes — delete the
+`.lock` file named in the error and try again, or use a different `--data-dir` for a deliberately
+parallel run. See [The lock file](#the-lock-file) above for exactly when a lock is considered
+stale.
+</details>
+
+<details>
+<summary><strong>The run exited with a non-zero code even though it looked like it worked</strong></summary>
+
+Check the last few lines of output before assuming something's wrong — `nuke`, `sweep`, `run` and
+`verify` all use their exit code to mean "the account is provably in the state you asked for",
+which is stricter than "no error was thrown". The most common non-error reason: `--limit` was
+reached with tweets still outstanding, so the run reports `STOPPED EARLY` on purpose and exits `1`
+— that's not a failure, it's the tool refusing to say "done" about a job it deliberately stopped
+partway through. See [Exit codes](#exit-codes) for the full list of what each code means for each
+command.
+</details>
+
+<details>
+<summary><strong>A bad <code>--data-dir</code> (unwritable, doesn't exist, full disk) fails with a raw stack trace</strong></summary>
+
+It shouldn't — the logger is the first thing every command sets up, so a directory it can't create
+for the log file surfaces as a plain, actionable error naming the path and suggesting a writable
+`--data-dir` or `--log`. If you see a raw Node stack trace instead, that's itself worth reporting;
+see [the bug report template](https://github.com/4riel/x-tweet-nuker/blob/main/.github/ISSUE_TEMPLATE/bug_report.yml).
 </details>
 
 <details>
@@ -352,9 +475,26 @@ changed something.
 </details>
 
 <details>
+<summary><strong><code>verify</code> prints <code>COULD NOT CHECK</code></strong></summary>
+
+X isn't showing the profile at all — it reported the account as suspended, protected (and this
+session doesn't follow it), or non-existent. This is deliberately never reported as `CLEAN`: a
+hidden profile most likely still holds every post it ever had, it just isn't being served to this
+viewer, and treating "nothing rendered because I'm not allowed to look" the same as "nothing
+rendered because there's nothing there" is exactly the bug this verdict exists to prevent. If
+you're checking your own account and it's showing as suspended, that's an X account-standing issue
+outside this tool's scope; if you're checking someone else's protected account with `--handle`,
+you'd need to be following it (signed in as the account you followed it with) to see anything.
+</details>
+
+<details>
 <summary><strong>The run state file got corrupted</strong></summary>
 
 An unparseable `.nuke-state.json` is renamed to `.nuke-state.json.corrupt-<timestamp>` and the run
-starts from an empty state rather than refusing to start. The worst case is re-issuing deletes for
-ids that are already gone, which X reports harmlessly as "not found".
+starts from an empty state rather than refusing to start — but it says so loudly rather than
+silently: a warning names the exact backup file and states plainly that this run starts from ZERO
+recorded progress, specifically so that isn't discovered only by noticing an all-night run redoing
+work it already did. The corrupted file isn't deleted, only set aside, so nothing already on disk
+is lost. The worst practical consequence is re-issuing deletes for ids that are already gone, which
+X reports harmlessly as "not found" and the tool records as `gone`.
 </details>

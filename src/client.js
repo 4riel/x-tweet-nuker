@@ -31,6 +31,9 @@ const ALREADY_GONE = /not found|no status found|does not exist/i;
  */
 const MAX_RATE_LIMIT_ATTEMPTS = 8;
 
+/** How often a long rate-limit wait says it is still waiting. See waitWithProgress. */
+const PROGRESS_INTERVAL_MS = 60 * 1000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -54,10 +57,38 @@ function createClient({ session, logger, config = {} }) {
       "Run `x-tweet-nuker login` again to capture a complete session."
     );
   }
+  // Normalised once, here, because ownership is decided by `legacy.user_id_str === myUserId` and
+  // that comparison is strict: a session file holding the id as a JSON number (hand-edited, or
+  // written by another tool) matches nothing, the sweep harvests zero posts, and the account is
+  // declared CLEAN with every tweet still on it. Anything that is not a run of digits cannot be
+  // an X user id at all, and is refused rather than quietly used.
+  const myUserId = String(session.myUserId).trim();
+  if (!/^\d+$/.test(myUserId)) {
+    throw new UserError(
+      "The saved session records " +
+        JSON.stringify(session.myUserId) +
+        " as this account's user id, which is not a numeric X user id.",
+      "X user ids are digits only (the `twid` cookie). Run `x-tweet-nuker login` again to capture a " +
+        "correct session; do not hand-edit " +
+        (config.sessionFile || "the session file") +
+        "."
+    );
+  }
 
   const maxWaitMs = config.maxRateLimitWaitMs || 20 * 60 * 1000;
-  // Timeline 429s are counted here because each page fetch is a separate call; the mutations
-  // count their own attempts locally, so one successful delete always resets the escalation.
+  // Two different scopes, and the difference matters for when the run gives up.
+  //
+  // Timeline reads keep their counter here, on the client, because one page fetch is one call
+  // that returns to the caller: the escalation has to survive across calls or a sweep would
+  // restart the backoff from 60s on every retried cursor forever. It is reset by any timeline
+  // response that is not a 429.
+  //
+  // The mutations count their attempts in a local inside deleteTweet/unretweet, so the
+  // MAX_RATE_LIMIT_ATTEMPTS budget is per tweet id, NOT per run: each id gets its own eight
+  // escalating retries, and a successful delete does not "reset" anything, because there was
+  // never a shared counter for it to reset. The run therefore only aborts when X refuses the
+  // same single deletion eight times in a row - not when eight deletions across the run are
+  // each refused once.
   let timelineRateLimitAttempts = 0;
 
   function headers() {
@@ -137,7 +168,36 @@ function createClient({ session, logger, config = {} }) {
       "Rate limited by X - waiting " + Math.round(capped / 1000) + "s: " + reason,
       context
     );
-    await sleep(capped);
+    await waitWithProgress(capped, context);
+  }
+
+  /**
+   * Sleep, saying so on the way through.
+   *
+   * A wait can be twenty minutes long, and a single line followed by twenty minutes of silence
+   * is indistinguishable from a hang - which is the one thing a user watching an unattended
+   * overnight run cannot check without killing it. So anything longer than a minute reports what
+   * it is still doing, roughly once a minute, and the countdown is what proves it is alive.
+   */
+  async function waitWithProgress(totalMs, context) {
+    const until = Date.now() + totalMs;
+    if (totalMs <= PROGRESS_INTERVAL_MS + 30000) {
+      await sleep(totalMs);
+      return;
+    }
+    for (;;) {
+      const left = until - Date.now();
+      if (left <= 0) return;
+      await sleep(Math.min(left, PROGRESS_INTERVAL_MS));
+      const remaining = until - Date.now();
+      if (remaining <= 1000) return;
+      logger.info(
+        "Still waiting out the rate limit - about " +
+          Math.ceil(remaining / 60000) +
+          " minute(s) left before the next attempt",
+        context
+      );
+    }
   }
 
   async function request(url, init) {
@@ -232,7 +292,7 @@ function createClient({ session, logger, config = {} }) {
   function timelineRequestUrl(templateUrl, cursor) {
     const url = new URL(templateUrl);
     const variables = JSON.parse(url.searchParams.get("variables") || "{}");
-    variables.userId = session.myUserId;
+    variables.userId = myUserId;
     variables.count = config.timelinePageSize || 100;
     if (cursor) variables.cursor = cursor;
     else delete variables.cursor;
@@ -269,7 +329,7 @@ function createClient({ session, logger, config = {} }) {
 
     const items = new Map();
     const cursors = [];
-    collectOwnTweets(res.json, session.myUserId, items, cursors);
+    collectOwnTweets(res.json, myUserId, items, cursors);
     return { items, cursors, failed: false };
   }
 
@@ -291,7 +351,7 @@ function createClient({ session, logger, config = {} }) {
     if (res.http >= 400 || !res.json) return { ok: false, http: res.http };
 
     const users = Array.isArray(res.json) ? res.json : Array.isArray(res.json.users) ? res.json.users : [];
-    const mine = users.find((user) => user && String(user.user_id) === String(session.myUserId));
+    const mine = users.find((user) => user && String(user.user_id) === myUserId);
     // A live session that cannot name itself is still a live session; the caller decides whether
     // it needs the handle badly enough to stop.
     return { ok: true, handle: (mine && mine.screen_name) || null };
@@ -354,5 +414,6 @@ module.exports = {
   USER_AGENT,
   ALREADY_GONE,
   MAX_RATE_LIMIT_ATTEMPTS,
+  PROGRESS_INTERVAL_MS,
   sleep,
 };

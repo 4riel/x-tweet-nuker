@@ -40,6 +40,23 @@ const KNOWN_TIMELINE_OPS = [
 /** Lookups, not timelines - capturing these would waste sweep passes on empty payloads. */
 const NOT_A_TIMELINE = /^User(ByScreenName|ByRestId|sByRestIds|Business|Premium)/;
 
+/**
+ * Every profile tab that can hold your own posts, as a path suffix after /<handle>.
+ *
+ * THE SINGLE SOURCE OF TRUTH FOR THIS LIST. Two commands depend on it and they must never
+ * disagree: `login` visits each tab so the timeline request it fires gets captured (a timeline
+ * the sweep never captured is a timeline the sweep can never clear), and `verify` checks each
+ * tab before it will say the account is empty. If `verify` ever checked a tab `login` did not
+ * visit, the user would be told NOT CLEAN forever and sent to run a sweep that structurally
+ * cannot fix it. Hence one list, imported by both. See test/session.test.js.
+ *
+ * Two of these only fire their GraphQL operation while you are standing on them:
+ *  - Highlights fires UserHighlightsTimeline only there.
+ *  - Reposts (its own profile tab now, at /<handle>/reposts) fires UserRepostsTimeline only
+ *    there - the Posts tab fires UserOriginalsTimeline, which is originals.
+ */
+const PROFILE_TABS = ["/with_replies", "", "/media", "/highlights", "/reposts"];
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isTimelineOperation(name) {
@@ -153,11 +170,44 @@ async function captureSession({ config, logger, loginTimeoutMs = 5 * 60 * 1000 }
       );
     }
 
-    const handle = config.handle || (await detectHandle(page));
+    // Detection first, always. `config.handle || detectHandle(...)` let --handle or an X_HANDLE
+    // line in a .env override what the browser was actually signed in as, and wrote that wrong
+    // name into the session file right next to the correct myUserId - mislabelling every future
+    // run, including the confirmation gate. --handle stays available as the fallback for when
+    // detection genuinely fails, but it can no longer contradict what X says.
+    const detected = await detectHandle(page);
+    if (detected && config.handle && detected.toLowerCase() !== config.handle.toLowerCase()) {
+      throw new UserError(
+        "You asked for @" +
+          config.handle +
+          ", but the browser is signed in as @" +
+          detected +
+          " (user id " +
+          myUserId +
+          ").",
+        "Saving @" +
+          config.handle +
+          " would label this session with an account it cannot delete from. Sign in as @" +
+          config.handle +
+          " in the browser, or drop --handle (and any X_HANDLE line in your .env) to use @" +
+          detected +
+          "."
+      );
+    }
+    const handle = detected || config.handle;
     if (!handle) {
       throw new UserError(
         "Could not work out which handle is signed in.",
         "Re-run with --handle <your-handle> (no @)."
+      );
+    }
+    if (!detected) {
+      logger.warn(
+        "Could not read the signed-in handle from the page; recording @" +
+          handle +
+          " from --handle/X_HANDLE without confirming it. Deletion targets user id " +
+          myUserId +
+          " whatever that account is called."
       );
     }
     logger.info("Signed in", { handle, userId: myUserId });
@@ -166,13 +216,9 @@ async function captureSession({ config, logger, loginTimeoutMs = 5 * 60 * 1000 }
 
     // Visiting the profile tabs is what makes the timeline requests fire so they can be captured.
     logger.info("Capturing timeline requests from your profile tabs");
-    // Every tab that can render your own posts, so each one's timeline request gets captured. A
-    // timeline the sweep never captured is a timeline the sweep can never clear, so a tab that
-    // only fires its operation when you are standing on it has to be visited:
-    //  - Highlights fires UserHighlightsTimeline only there.
-    //  - Reposts (a separate profile tab now, at /<handle>/reposts) fires UserRepostsTimeline
-    //    only there - the Posts tab fires UserOriginalsTimeline, which is originals.
-    for (const suffix of ["/with_replies", "", "/media", "/highlights", "/reposts"]) {
+    // PROFILE_TABS, not a list of its own: `verify` checks exactly these tabs, and a tab it
+    // checks but this never visited is an unfalsifiable NOT CLEAN. See PROFILE_TABS.
+    for (const suffix of PROFILE_TABS) {
       await page
         .goto("https://x.com/" + handle + suffix, { waitUntil: "domcontentloaded" })
         .catch(() => {});
@@ -339,5 +385,6 @@ module.exports = {
   sessionAgeHours,
   isTimelineOperation,
   KNOWN_TIMELINE_OPS,
+  PROFILE_TABS,
   FALLBACK_QUERY_IDS,
 };

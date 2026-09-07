@@ -5,10 +5,11 @@
  * discover tweets by paging a timeline that is shrinking underneath it. It cannot cover
  * retweets or anything posted after the export, which is what `sweep` is for.
  */
-const { createRunContext, requireHandle } = require("../context");
+const { createRunContext, resolveTargetHandle } = require("../context");
 const { readArchiveIds } = require("../archive");
-const { loadState } = require("../state");
-const { confirmDestruction } = require("../confirm");
+const { loadState, applyDeleteResult } = require("../state");
+const { createRateWindow, PROGRESS_EVERY } = require("../logger");
+const { confirmDestruction, requireGate } = require("../confirm");
 const { UserError } = require("../errors");
 
 const flags = {
@@ -25,7 +26,8 @@ const flags = {
  */
 async function run(config, options = {}) {
   const ctx = options.ctx || createRunContext(config);
-  const { logger, client } = ctx;
+  const { logger, client, session } = ctx;
+  const gate = requireGate(ctx);
 
   const archive = readArchiveIds(config.archivePath);
   if (archive.total === 0) {
@@ -40,13 +42,19 @@ async function run(config, options = {}) {
   // A dry run writes nothing, so it must not take the lock away from a real run.
   const state = loadState(config.stateFile, { lock: !config.dryRun, logger });
   let todo = archive.ids.filter((id) => !state.isHandled(id));
-  const skipped = archive.total - todo.length;
+  // "handled" is the word for deleted-or-gone everywhere in this tool; the local that feeds the
+  // `alreadyHandled` line below used to be called `skipped`, which named nothing else.
+  const alreadyHandled = archive.total - todo.length;
+  // Tracked, not just applied: a run cut short by --limit finishes with tweets still in the
+  // archive, and has to say so instead of exiting 0 like a completed pass.
+  const outstanding = todo.length;
+  const stoppedAtLimit = config.limit > 0 && outstanding > config.limit;
   if (config.limit > 0) todo = todo.slice(0, config.limit);
 
   logger.info("Archive loaded", {
     files: archive.files.length,
     tweets: archive.total,
-    alreadyHandled: skipped,
+    alreadyHandled,
     queued: todo.length,
   });
 
@@ -65,41 +73,43 @@ async function run(config, options = {}) {
     return 0;
   }
 
-  if (!options.alreadyConfirmed) {
+  // Keyed on the gate, so `run` confirming once covers both passes and nothing else can skip it.
+  if (!gate.armed) {
+    const target = await resolveTargetHandle(ctx);
     await confirmDestruction({
-      handle: await requireHandle(ctx),
+      handle: target.handle,
+      verified: target.verified,
+      userId: session.myUserId,
       action: "delete every tweet listed in your archive",
       count: todo.length,
       assumeYes: config.assumeYes,
       logger,
+      gate,
     });
   }
 
   const summary = { deleted: 0, gone: 0, failed: 0 };
-  const startedAt = Date.now();
+  const rate = createRateWindow();
 
   try {
     for (let i = 0; i < todo.length; i++) {
       const id = todo[i];
       const result = await client.deleteTweet(id);
 
-      if (result.status === "deleted") {
-        state.markDeleted(id);
-        summary.deleted++;
-      } else if (result.status === "gone") {
-        state.markGone(id);
-        summary.gone++;
-      } else {
-        state.markFailed(id, result.message, result.http);
-        summary.failed++;
+      const recorded = applyDeleteResult(state, id, result, summary);
+      if (recorded === "failed") {
         logger.warn("Delete failed", { id, http: result.http, message: result.message });
+      } else {
+        rate.record();
       }
 
       state.saveThrottled();
-      if ((i + 1) % 50 === 0) {
+      if ((i + 1) % PROGRESS_EVERY === 0) {
         logger.info("Progress " + (i + 1) + "/" + todo.length, {
           ...summary,
-          rate: ratePerMinute(summary.deleted + summary.gone, startedAt),
+          remaining: todo.length - (i + 1),
+          // Recent-window, not a lifetime average, and no ETA. See createRateWindow.
+          perMinute: rate.perMinute(),
         });
       }
       if (config.delayMs > 0) await client.sleep(config.delayMs);
@@ -113,15 +123,23 @@ async function run(config, options = {}) {
     logger.warn(
       "Some deletions failed. Re-running `nuke` retries them; ids and messages are in " + config.stateFile + "."
     );
-    // Non-zero so a script can tell "the archive is cleared" from "some of it is still there".
-    return 1;
   }
+  if (stoppedAtLimit) {
+    ctx.stoppedAtLimit = true;
+    logger.plain("");
+    logger.plain(
+      "  STOPPED EARLY - --limit " +
+        config.limit +
+        " reached; " +
+        (outstanding - todo.length) +
+        " archive tweet(s) were never attempted."
+    );
+    logger.plain("  This run was incomplete on purpose. Re-run without --limit to finish the job.");
+    logger.plain("");
+  }
+  // Non-zero so a script can tell "the archive is cleared" from "some of it is still there".
+  if (summary.failed > 0 || stoppedAtLimit) return 1;
   return 0;
-}
-
-function ratePerMinute(count, startedAt) {
-  const minutes = (Date.now() - startedAt) / 60000;
-  return minutes > 0 ? Math.round(count / minutes) : 0;
 }
 
 module.exports = { run, flags, description: "Delete every tweet listed in your archive's tweets.js" };

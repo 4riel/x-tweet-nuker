@@ -24,6 +24,13 @@ the thing being checked). `verify` is not otherwise independent of `src/client.j
 makes one plain HTTP call through it (`fetchOwnHandle`) before ever opening a page, as a cheap
 sanity check and a fallback source for the handle.
 
+Two things sit in front of every deletion, and neither is a JSON shape or an HTTP status: the
+confirmation gate (`src/confirm.js`) that makes `deleteTweet`/`unretweet` structurally incapable of
+firing before a human (or `--yes`) has agreed, and identity verification (`src/context.js`) that
+checks the handle on that confirmation banner against what X itself says the session belongs to.
+Both are covered right after session capture, below, because they matter before anything else in
+this document does.
+
 ## 1. Session capture (`login`, `src/session.js`)
 
 `login` launches a persistent Playwright Chromium context rooted at `.chrome-user-data/` (so a
@@ -34,8 +41,15 @@ second `login` reuses the same signed-in profile), then:
    headless mode with no existing session this fails fast instead of hanging silently.
 2. Once signed in, builds the cookie header by joining every cookie as `name=value; ...`, and
    reads the account's numeric id out of the `twid` cookie (`u=<id>`, URL-decoded).
-3. Detects the handle from the app's own nav bar (`a[data-testid="AppTabBar_Profile_Link"]`'s
-   `href`), unless `--handle` was given.
+3. **Detects the handle** from the app's own nav bar (`a[data-testid="AppTabBar_Profile_Link"]`'s
+   `href`) — always attempted first, regardless of `--handle`/`X_HANDLE`. If detection succeeds and
+   a claimed handle was also given, and the two disagree, `login` refuses outright rather than
+   saving a session labelled with an account it cannot actually delete from (the failure names both
+   handles and the numeric id). `--handle`/`X_HANDLE` only ever supplies the handle when detection
+   itself genuinely fails - it can never override a successful detection. This used to work the
+   other way around (`config.handle || detectHandle(...)`), which meant a stale `--handle` or an
+   old `X_HANDLE` line in `.env` could silently mislabel a session for a different account than the
+   browser was actually signed into — including on the confirmation gate later.
 4. **Scrapes live GraphQL `queryId`s** (`scrapeQueryIds`): collects every `abs.twimg.com/*.js`
    bundle URL the page has loaded (from `<script src>` tags and from
    `performance.getEntriesByType("resource")`, since code-split chunks loaded after first paint
@@ -82,6 +96,107 @@ second `login` reuses the same signed-in profile), then:
 `graphqlOperationsSeen` is the full, unfiltered list of every GraphQL operation name the browser
 requested during login — kept specifically so a user whose sweep captures nothing has something
 to diagnose against (see [Troubleshooting](CLI.md#troubleshooting) in the CLI reference).
+
+## Archive parsing (`src/archive.js`)
+
+`nuke`'s id source, and the fast path `run` prefers over discovering everything by paging
+timelines. It reads `tweets.js` (or a directory of `tweets*.js` files) from an unzipped X archive,
+and its one real design constraint is size: a heavy account's `tweets.js` is routinely hundreds of
+megabytes, and reading that into one JavaScript string before calling `JSON.parse` on it would cost
+roughly 3.3x the file size in heap — and fail outright past 512 MB, V8's hard limit on a single
+string's length. An account with on the order of 200,000 tweets is exactly the case this exists
+for; it is not a limit this tool has.
+
+**`streamArchiveArray`** is a hand-written streaming JSON-array scanner that never holds the whole
+file in memory. It reads the file in fixed-size chunks (1 MB, `CHUNK_BYTES`) directly into a
+reused byte buffer via `fs.readSync`, and scans *bytes*, not decoded characters: every JSON
+structural character (`{`, `}`, `[`, `]`, `"`, `,`) is ASCII, and no byte of a multi-byte UTF-8
+sequence is ever below `0x80`, so a byte-level scan can never mistake part of a multi-byte
+character for a bracket or a quote. Only the bytes of one complete, already-bounded element are
+ever handed to `JSON.parse` and then discarded — so peak memory is roughly one buffer plus one
+tweet, not one buffer per file size.
+
+The scan tracks bracket depth and string/escape state to find where each top-level array element
+starts and ends (`readValue`), calls `onEntry` with the parsed element, and immediately forgets the
+raw bytes behind it — `more()` drops everything before the current element on every refill
+(`buf.copyWithin`), only growing the buffer when a single element is bigger than the current chunk
+size. An `anchor` pins the first byte of whatever element is currently being captured, so a refill
+mid-element can't discard bytes that capture still needs. This also rejects the malformed array
+shapes (`[1 2]`, `[,1]`, `[1,]`) that `JSON.parse` would have caught, via an explicit
+comma/no-comma state machine around each element, and throws the same kind of `SyntaxError`
+`JSON.parse` would for a truncated or malformed file — surfaced as a `UserError` naming the file.
+
+Two wrapper concerns sit around the scanner:
+
+- **The `window.YTD.tweets.part0 = ` assignment prefix.** Some archive exports wrap the array
+  literal in a JS assignment rather than shipping bare JSON. The first `HEAD_CHARS` (512) bytes are
+  read up front (also enough to skip a UTF-8 BOM), matched against `ASSIGNMENT_PREFIX`, and the
+  cursor advanced past whatever prefix matched before the streaming scan looks for the opening
+  `[`.
+- **Fallback for anything that isn't a JSON array literal at all.** If `streamArchiveArray` returns
+  `false` (the byte after skipping whitespace and any prefix isn't `[`), `parseArchiveFile` falls
+  back to reading the whole file and calling `JSON.parse` on it directly — safe to do at that point
+  precisely because whatever this file is, it isn't a real archive export, so it's very unlikely to
+  be hundreds of megabytes. This is also what gives a malformed file the same diagnosis it always
+  had, rather than a scanner-specific error message.
+
+**`readArchiveIds`** feeds every parsed entry through `collect`, which accepts either an archive
+record (`{ tweet: { id_str, created_at, ... } }`) or a bare id string — so a hand-written JSON array
+of id strings is accepted too, which is the supported way to hand `nuke` a curated subset of ids
+rather than everything in the archive (this tool has no other selection mechanism — no filtering by
+date, content, or engagement). Ids are deduplicated as they stream in, via a `Map` from id to array
+position, so a multi-part archive that lists the same tweet twice doesn't cost memory proportional
+to the duplicate count; the earliest `created_at` seen for a given id wins. The result is sorted
+oldest-first before being returned — deliberately, so that a run interrupted partway through leaves
+the *most recent* tweets undeleted, which are the easiest ones to sanity-check by hand.
+
+## The confirmation gate and identity verification (`src/confirm.js`, `src/context.js`)
+
+Deleted tweets cannot be restored, so the confirmation prompt is not treated as UI - it's treated
+as an access-control problem, and it's solved the same way: fence the dangerous operations
+themselves, not the code paths that are supposed to lead to them.
+
+**The gate (`createDestructionGate`) wraps the client, not the command.** `createRunContext` builds
+the gate before the client and immediately wraps the client with `gate.protect()`, so no command
+ever holds an unguarded reference to `deleteTweet` or `unretweet` (the two entries in
+`DESTRUCTIVE_METHODS`). Every other client method — timeline reads, `fetchOwnHandle`, `sleep` —
+passes through untouched. Until `gate.arm(handle)` has actually been called, the wrapped
+`deleteTweet`/`unretweet` throw a `UserError` instead of ever reaching the real client method — so
+a bug that reaches a delete call without asking first fails loudly as "this is a bug in
+x-tweet-nuker", not silently as a real deletion. This replaced an earlier design where the ask
+happened at the right *moment* in the flow (e.g. "only on round 1"); that is not the same as
+enforcement, because a `continue` that skipped round 1 walked straight past a moment-based check.
+`sweep`'s harvest-fails-so-retry path is exactly that shape — a `continue` before the confirmation
+would have been reached — which is why the gate had to move onto the calls themselves.
+
+**`requireGate(ctx)`** is the first line of every destructive command: it proves the run's own
+client really is the one its own gate fenced (`client[GUARDED_BY] !== gate` fails otherwise, via a
+non-forgeable `Symbol`), so a future refactor that assembles a context by hand can't quietly hand a
+command a raw, unfenced client.
+
+**Identity verification (`resolveTargetHandle`, `src/context.js`)** answers a different question:
+not "did anyone agree", but "is the account named on that agreement actually the one about to be
+emptied". The handle shown on the confirmation banner is only ever a label - the numeric user id in
+the session file is what deletion actually targets - so a `--handle`/`X_HANDLE` value that
+disagrees with what X itself reports is refused outright rather than silently preferred:
+
+- If a claimed handle is given and `fetchOwnHandle()` succeeds and disagrees, the run is refused,
+  naming both the claimed and the actual handle plus the numeric user id.
+- If a claimed handle is given and the probe succeeds and agrees, it's marked `verified: true`.
+- If no handle is claimed at all and the probe succeeds, the reported handle is adopted and marked
+  `verified: true`.
+- If the probe fails (network error, X moved the endpoint, HTTP error) and a handle *was* claimed,
+  the run is **not** blocked - it proceeds with that handle marked `verified: false`, and
+  `confirmDestruction`'s banner prints `!! UNVERIFIED` next to it along with the numeric user id
+  that will actually be emptied (see the banner's exact wording in `src/confirm.js`). Blocking here
+  would mean the tool permanently stops working the day X renames or moves this identity endpoint -
+  worse than proceeding, honestly labelled as unverified.
+- If the probe fails and there is no claimed handle either, the run refuses: it will not delete
+  from an account it cannot name even provisionally.
+
+The result is cached on the context (`ctx.target`) so it's resolved once per run, not once per call
+- `nuke`, `sweep` and `run` (which drives both) all call it, and `run` confirming once has to cover
+both passes without re-probing.
 
 ## 2. The GraphQL request shape (`src/client.js`)
 
@@ -202,22 +317,43 @@ differs from the current cursor) until either the next cursor is unavailable, or
 running total — a page whose items were all already seen on an earlier timeline still resets the
 counter, so a shared timeline's later pages aren't cut short), or `maxTimelinePages` (200) is hit —
 whichever comes first. Results across all timelines are merged into one deduplicated map by tweet
-id, and the count of pages that came back `failed` is tracked alongside it.
+id, and the count of pages that came back `failed` is tracked alongside it, alongside a list of
+which timeline(s) hit the page cap (`cappedTimelines`) — logged as `Stopped paging <timeline> at
+the 200-page cap while it was still handing out cursors`, since a genuinely huge, still-live
+timeline and one that simply hit an arbitrary cap look identical from the caller's side unless this
+is tracked explicitly.
 
 **Why rounds, not one pass**: deletion on X is eventually consistent — a tweet can still be served
 by a timeline for a while after a successful delete. A single empty-looking harvest proves
 nothing about the tens of tweets that were server-side "deleted" moments earlier but haven't
 dropped out of the timeline cache yet. So `sweep` repeats the harvest-and-delete cycle, up to
 `maxRounds` (default 30, minimum 1, `--max-rounds`) times, and only declares success when one full round's
-harvest returns zero items **and zero failed pages** across every timeline. A round that found
-nothing only because requests were failing is explicitly *not* treated as clean — it's logged as
-inconclusive and retried after a short pause, since a tool that can silently report "CLEAN" after
-merely failing to look is worse than one that keeps trying. If it runs out of rounds without a
-genuinely clean pass, it says so and suggests running `sweep` again after a short wait, since the
-state it needs (`.nuke-state.json`) already reflects everything actually deleted.
+harvest returns zero items **and zero failed pages and zero capped timelines** across every
+timeline. A round that found nothing only because requests were failing, *or* because a timeline
+stopped paginating at the cap while it still had cursors left to hand out, is explicitly *not*
+treated as clean — both are logged as inconclusive and retried after a short pause, since a tool
+that can silently report "CLEAN" after merely failing to look all the way to the end is worse than
+one that keeps trying. This is also the one way `sweep` can exit non-zero having found zero posts
+in a round: hitting the page cap with nothing on the timeline yet, while the timeline is still
+paginating, is not the same claim as the timeline actually being empty. If it runs out of rounds
+without a genuinely clean pass, it says so and suggests running `sweep` again after a short wait,
+since the state it needs (`.nuke-state.json`) already reflects everything actually deleted.
 
 Within a round, each item that has a `retweetOf` gets `unretweet(retweetOf)` before
-`deleteTweet(item.id)`; both count independently in the round's summary.
+`deleteTweet(item.id)`; both count independently in the round's summary. Progress within a round is
+logged every `PROGRESS_EVERY` (50) deletions as `Round N progress <done>/<total> {...,
+"remaining":…, "perMinute":…}`, and the round itself ends with `Round N deleted <count> {...}`
+(this line used to read "removed"; it's "deleted" now, to match the vocabulary `state.js` uses
+everywhere else). `nuke`'s own progress lines use the identical `{remaining, perMinute}` pair via
+the same `createRateWindow()` helper (`src/logger.js`) — `remaining` is what's left in the current
+pass or round, and `perMinute` is a **recent-window** rate (the last ~5 minutes of recorded
+deletions), not a lifetime average. That choice is deliberate: a lifetime average is worst exactly
+when someone is watching it, because one long rate-limit stall drags it down permanently and it
+never recovers even once the run is back to full speed. There is deliberately **no ETA** derived
+from either figure anywhere in this tool's output — X's throttling is bimodal (full speed, then a
+wall of up to 20 minutes), so any time-remaining estimate would be wrong by an order of magnitude
+in one direction or the other, and it would be most wrong at the exact moment someone stops to read
+it.
 
 ## 5. Rate-limit handling (`waitForRateLimit`)
 
@@ -248,6 +384,14 @@ This is why a run can appear to sit idle for a while: it is very likely honoring
 not stuck — but it is no longer *unconditionally* patient the way it once was, and will now
 surface an explicit error instead of waiting forever if X keeps refusing the same request.
 
+**`waitWithProgress`** is what keeps a long wait from looking exactly like a hang: a plain
+`sleep(ms)` is fine for a short wait, but a 20-minute one, watched from a silent terminal on an
+unattended overnight run, is indistinguishable from the process having died. Any wait longer than
+`PROGRESS_INTERVAL_MS + 30s` (roughly a minute and a half) is instead broken into ~60-second
+sleeps, and after each one — as long as more than a second of the wait remains — logs `Still
+waiting out the rate limit - about N minute(s) left before the next attempt`. That heartbeat is the
+only signal that separates "still rate limited" from "something broke silently".
+
 ## 6. Resumable state (`src/state.js`)
 
 `.nuke-state.json` holds three arrays — `done` (deleted), `gone` (already gone when checked), and
@@ -265,10 +409,27 @@ failing, not a lifetime tally of every failure the run has ever hit.
 Writes are throttled to once every 5 seconds during a run (`saveThrottled`) and forced on
 completion or on error (`finally { state.save() }` in both commands), and each save is atomic —
 written to `<file>.tmp` then renamed over the real file — so a hard kill mid-write can't corrupt
-the state a resumed run depends on. If the existing state file fails to parse, it's renamed aside
-as `<file>.corrupt-<timestamp>` and a fresh empty state is started rather than blocking the run;
-the worst consequence of losing state is re-issuing some deletes, which X reports back as
-"already gone" harmlessly.
+the state a resumed run depends on.
+
+If the existing state file fails to parse, it's renamed aside as `<file>.corrupt-<timestamp>` and a
+fresh empty state is started rather than blocking the run — but not silently. Two `logger.warn`
+calls fire: one names the exact backup file the unreadable original was moved to and states plainly
+that this run starts from **zero** recorded progress, the other spells out the practical
+consequence (every already-deleted id gets attempted again, which X answers with "not found" and
+this tool records as `gone`, harmlessly). The point of making this loud rather than quiet is that
+somebody resuming a run of several thousand tweets deserves to know *before* the run spends all
+night re-discovering that, not after.
+
+**Saves are also tolerant of failure, not just of corruption on load.** `save()` never throws: a
+transient write failure (antivirus or a sync client holding the file for a moment — a normal event
+on the platforms this tool runs on) is caught, warned about, and left for the next `saveThrottled`
+call to retry — deletions keep happening even though the most recent one couldn't be recorded yet.
+What it does *not* do is retry silently forever: `saveThrottled` counts consecutive failures, and
+once that count reaches `MAX_CONSECUTIVE_SAVE_FAILURES` (5), it throws a `UserError` and the run
+stops *before* deleting anything else. The reasoning is asymmetric on purpose — a single locked
+file must not kill an hours-long run, but a disk that's genuinely full or read-only must not be
+allowed to let the run keep deleting tweets it has no way to record, because everything deleted
+since the last successful save would have to be rediscovered by a full sweep next time.
 
 ### The state lock
 
@@ -281,21 +442,53 @@ independently; whichever saves last silently erases the other's progress, and th
 already-deleted ids get retried. `status` and dry runs never take the lock, since they never write
 the state file.
 
-Staleness is judged differently depending on where the existing lock came from:
+A lock is judged stale by two independent checks, either of which is sufficient:
 
-- **Same hostname**: settled by `process.kill(pid, 0)` — if that process is still alive (or exists
-  but under another user, which reports `EPERM`, still counted as alive), the lock holds no matter
-  how long it's been quiet, because a real run can sit inside an hour of escalating rate-limit
-  waits without writing anything. If the pid is gone, the lock is stale and gets taken over
-  immediately, with a warning logged.
-- **A different hostname** (a data directory shared over a network drive) can't be probed by pid,
-  so it falls back to elapsed time since `touchedAt`/`startedAt`: stale after `LOCK_STALE_MS`, 90
-  minutes.
+- **Silence, on any platform, including this one.** A lock that has gone more than `LOCK_STALE_MS`
+  (90 minutes) without a `touch()` is stale regardless of hostname or pid. This is the backstop,
+  and it applies even to a lock recorded as belonging to a pid that is technically still alive on
+  this machine — because operating systems recycle process ids, especially on Windows and inside
+  containers, and a live pid alone was found to pin a lock forever for a run that had actually been
+  gone for days. 90 minutes is chosen to comfortably clear the longest silence a genuinely live run
+  can have: sitting through the full escalating rate-limit backoff (`MAX_RATE_LIMIT_ATTEMPTS`, 8
+  attempts) is roughly 75 minutes without writing anything.
+- **A dead pid, on this host specifically, is stale immediately** — no need to wait out the 90
+  minutes after an ordinary crash or a hard kill. `process.kill(pid, 0)` settles this
+  (`EPERM` — the pid exists but belongs to another user — still counts as alive); it's only ever
+  checked for a lock recorded on this same hostname, since a pid from another machine can't be
+  probed at all.
 
-The lock is released (`fs.unlinkSync`) on `process.on("exit")`, so a normal exit or Ctrl-C cleans
-it up on its own; it is never released if the process is killed outright (`SIGKILL`, an OOM
-killer), which is exactly the case the pid-liveness check above is designed to recover from
-automatically on the next run.
+You only need to intervene by hand — delete the `.lock` file, or point at a separate `--data-dir`
+— if you're certain no other run is using that data directory and the lock is still refused inside
+that 90-minute window.
+
+### Interrupt handling
+
+`loadState` installs real handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGBREAK` the first time
+any run opens the state for writing (`installInterruptHandlers`, once per process — `run` opens the
+state twice, for the archive pass and then the sweep, and a second listener set per state object
+would trip Node's max-listeners warning; a module-level `signalOwner` variable tracks which state
+object is "current" and is the one an interrupt actually flushes).
+
+This replaced relying on `process.on("exit")` alone, which turned out not to be enough: on Windows,
+Ctrl-C terminates the process without running `'exit'` handlers at all, so the lock file was left
+behind and nothing was flushed — and even on platforms where `'exit'` does fire, it has to run
+synchronously, so the `finally { state.save() }` inside an `async` delete loop never gets a turn
+before the process is gone. A real signal handler runs synchronously *before* exit and can await
+nothing extra, which is exactly the "flush, then leave" shape needed.
+
+On any of those four signals, `handleInterrupt` does exactly two things before calling
+`process.exit()` with the conventional `128 + signal` code: `state.save()`, then (if this state
+object holds the lock) `lock.release()`. A second signal arriving while the first is still handling
+is ignored (an `interrupted` flag), so Ctrl-C twice in a row can't re-enter the flush.
+
+The guarantee that produces, stated exactly and no stronger: **on Ctrl-C, SIGTERM, SIGHUP, or
+Ctrl-Break, every tweet id already resolved by this run is written to disk before the process
+exits.** At most the single deletion that was in flight at that exact moment is unrecorded, and
+that one is harmless — X reports an already-deleted tweet as "not found" the next time it's tried,
+which this tool records as `gone`. Only a kill the process cannot intercept at all — `SIGKILL`, an
+out-of-memory kill, a power loss — falls back to whatever the last throttled save captured, which
+is at most `SAVE_INTERVAL_MS` (5 seconds) of deletions behind.
 
 ## 7. `verify`, and the bug it was rewritten to fix
 
@@ -352,24 +545,42 @@ self-contained function with no closures), which returns:
   account's own owner — X just renders that region with nothing inside it — so `timelineRendered
   && timelineArticles === 0` is its own, separate proof of empty.
 - `text` — up to 2000 characters of the column's own text (falling back to `document.body`),
-  used only as a last resort against two wording patterns: `EMPTY_STATE` (a list of phrasings —
-  "hasn't posted", "no posts yet", "these posts are protected", etc. — for when neither structural
-  signal above fired) and `LOAD_FAILURE` (`/something went wrong|try again|retry/i`).
+  used only as a last resort against three wording patterns, checked in this order:
+  `UNAVAILABLE_STATE` (`/account is suspended|account suspended|these posts are protected|owner
+  limits who can view|doesn.t exist|does not exist/i` — X refusing to show this profile at all),
+  then, for a genuinely empty timeline, `EMPTY_STATE` (`/hasn.t posted|haven.t posted|hasn.t
+  replied|haven.t replied|hasn.t highlighted|haven.t highlighted|no posts yet|nothing to see
+  here/i`, for when neither structural signal above fired), and `LOAD_FAILURE`
+  (`/something went wrong|try again|retry/i`).
 
 That per-tab judgement lives in one exported pure function, `classifyTab(info, {loadFailed})`,
 rather than inline in the browser-driving loop — it is the single most consequential decision in
-the tool, so it is unit-testable without a browser (see `test/verify.test.js`). It returns
-`stillThere` if any status link or article rendered, `confirmedEmpty` if it is zero cards **and**
-proven empty, or `unconfirmed` otherwise. A tab's zero-cards result counts as proven empty only
-when the page is **not** a `LOAD_FAILURE` page *and* at least one of `emptyStateMarker`,
-`timelineRendered && timelineArticles === 0`, or the `EMPTY_STATE` text pattern is true — an
-explicit "Something went wrong" page is never accepted as evidence either way, and zero cards
-with no positive signal at all (X restructured the page, an unrecognized wording) is
-`unconfirmed`, never clean. Content that did render still wins over a load failure: a page that
-half-loaded but showed a post is `stillThere`, not `unconfirmed`. `verify` also optionally loads
-specific tweet ids directly
-(`https://x.com/i/status/<id>`) and checks for either zero `<article>` elements or a match against
-`MISSING_POST`, same idea at single-tweet scale.
+the tool, so it is unit-testable without a browser (see `test/verify.test.js`). It returns one of
+four outcomes, and the order below is also the order they're checked in, because content that
+rendered has to outrank every other signal — a half-loaded page that still shows a post is
+`stillThere`, not `unconfirmed`, and a page that renders content *and* an "unavailable" message
+(shouldn't happen, but if X's markup ever did both) is still `stillThere`:
+
+1. **`stillThere`** — any status link or bare `<article>` rendered at all. Checked first,
+   unconditionally.
+2. **`unavailable`** — nothing rendered, but the page matches `UNAVAILABLE_STATE`: X is refusing to
+   show this profile (suspended, protected and not followed, or nonexistent) rather than showing an
+   empty one. This used to sit inside `EMPTY_STATE` — meaning a suspended account, which still
+   holds every post it ever made and is merely hidden from view, could be reported `CLEAN` purely
+   because the rendered page happened to say "account is suspended". `unavailable` exists
+   specifically so that can never happen: it can never resolve to `confirmedEmpty`, because hidden
+   is not the same claim as empty.
+3. **`confirmedEmpty`** — nothing rendered, no `unavailable` match, and the page is **not** a
+   `LOAD_FAILURE` page, and at least one of `emptyStateMarker`, `timelineRendered &&
+   timelineArticles === 0`, or the `EMPTY_STATE` text pattern is true. An explicit "Something went
+   wrong" page is never accepted as evidence either way, in either direction.
+4. **`unconfirmed`** — everything else: zero cards, no `unavailable` match, but none of the three
+   positive empty-state signals fired either (X restructured the page, an unrecognized wording, or
+   the page genuinely failed to load).
+
+`verify` also optionally loads specific tweet ids directly (`https://x.com/i/status/<id>`) and
+checks for either zero `<article>` elements or a match against `MISSING_POST`, same idea at
+single-tweet scale.
 
 One legitimate empty state worth calling out, because it looks like it should be a problem and
 isn't: on an account without an X Premium subscription, the Highlights tab shows a "Highlight on
@@ -390,16 +601,25 @@ renders no empty-state element at all — it renders the timeline region (`aria-
 is the only thing that proves it. **Replies** and **Media** render `emptyState` *and* matching
 wording ("You haven't replied yet", "You haven't posted videos yet"). **Highlights** and
 **Reposts** render `emptyState` with no wording `EMPTY_STATE` matches. All five resolve to
-`confirmedEmpty`, by three different routes — which is why all three signals are kept.
+`confirmedEmpty`, by three different routes — which is why all three signals are kept. `login`
+visits these same five tabs, in the same order, to capture the timeline requests `sweep` pages
+through — see [`PROFILE_TABS`](#1-session-capture-login-srcsessionjs) — and `verify` deliberately
+checks the identical list rather than one of its own, imported from `src/session.js`; a tab
+`verify` checked but `login` never visited would be an unfalsifiable `NOT CLEAN` forever.
 
-The three tab-level outcomes roll up into three run-level verdicts:
+The four tab-level outcomes roll up into four run-level verdicts, checked and reported in this
+order (the same order `classifyTab` itself checks in):
 
 | Verdict | Condition | Exit code |
 |---|---|---|
 | `NOT CLEAN` | at least one tab (or checked id) is `stillThere` | `1` |
-| `COULD NOT CONFIRM` | no tab is `stillThere`, but at least one is `unconfirmed` | `1` |
+| `COULD NOT CHECK` | no tab is `stillThere`, but at least one is `unavailable` (X refused to show that profile — suspended, protected, or nonexistent) | `1` |
+| `COULD NOT CONFIRM` | no tab is `stillThere` or `unavailable`, but at least one is `unconfirmed` | `1` |
 | `CLEAN` | every tab is `confirmedEmpty` and every checked id is gone | `0` |
 
-`stillThere` always wins over `unconfirmed` — a tab that unambiguously has content on it makes
-the whole run NOT CLEAN even if another tab merely couldn't be confirmed. See
+`stillThere` always wins over everything else — a tab that unambiguously has content on it makes
+the whole run `NOT CLEAN` even if another tab was suspended or unconfirmed. `unavailable` in turn
+wins over `unconfirmed`: a profile X is actively refusing to show is a stronger, more specific
+signal that something is wrong than a page that simply rendered nothing recognizable. Neither
+`COULD NOT CHECK` nor `COULD NOT CONFIRM` can ever become `CLEAN` — see
 [Exit codes](CLI.md#exit-codes) in the CLI reference.

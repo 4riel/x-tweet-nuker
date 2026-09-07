@@ -91,7 +91,6 @@ function makeDocument(children = [], bodyText = "") {
   const body = new FakeElement("body", {}, children, bodyText);
   const root = new FakeElement("html", {}, [body]);
   root.body = body;
-  root.querySelector = (sel) => root.querySelector0(sel);
   // Delegate document.querySelector/All to the root element's own implementation.
   root.querySelector = FakeElement.prototype.querySelector.bind(root);
   root.querySelectorAll = FakeElement.prototype.querySelectorAll.bind(root);

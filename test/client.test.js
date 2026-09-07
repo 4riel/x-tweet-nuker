@@ -57,6 +57,63 @@ test("createClient throws UserError when the session has no myUserId", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The account id the ownership filter compares against. A mismatch here does not error - it
+// silently harvests nothing, and a sweep that harvests nothing declares the account CLEAN.
+// ---------------------------------------------------------------------------
+
+const TIMELINE_URL =
+  "https://x.com/i/api/graphql/qid-tl/UserOriginalsTimeline?variables=%7B%22userId%22%3A%22111%22%7D";
+
+function timelinePayload(ids, userId) {
+  return {
+    data: {
+      instructions: [
+        {
+          entries: ids.map((id) => ({
+            content: {
+              itemContent: {
+                tweet_results: { result: { legacy: { id_str: id, user_id_str: String(userId) } } },
+              },
+            },
+          })),
+        },
+      ],
+    },
+  };
+}
+
+test("a numeric myUserId still matches the account's own tweets instead of harvesting nothing", async () => {
+  // `legacy.user_id_str === myUserId` is a strict comparison; 111 !== "111" matches no post at
+  // all, the sweep finds an empty timeline and reports a full account as clean.
+  global.fetch = queuedFetch([jsonResponse(200, timelinePayload(["100", "200"], "111"))]);
+  const { client } = makeClient({}, { myUserId: 111 });
+  const page = await client.fetchTimelinePage(TIMELINE_URL, null);
+  assert.deepEqual(Array.from(page.items.keys()), ["100", "200"]);
+});
+
+test("a numeric myUserId is sent to X as the string it has to be", () => {
+  const { client } = makeClient({}, { myUserId: 111 });
+  const url = new URL(client.timelineRequestUrl(TIMELINE_URL, null));
+  assert.equal(JSON.parse(url.searchParams.get("variables")).userId, "111");
+});
+
+test("a myUserId that is not a numeric X user id is refused rather than quietly used", () => {
+  for (const bad of ["realaccount", "@realaccount", "u=111", "111abc", "  "]) {
+    assert.throws(
+      () => createClient({ session: session({ myUserId: bad }), logger: silentLogger() }),
+      UserError,
+      "should refuse " + JSON.stringify(bad)
+    );
+  }
+});
+
+test("the identity probe matches the session id whether it was stored as a string or a number", async () => {
+  global.fetch = queuedFetch([jsonResponse(200, [{ user_id: 111, screen_name: "realaccount" }])]);
+  const { client } = makeClient({}, { myUserId: 111 });
+  assert.deepEqual(await client.fetchOwnHandle(), { ok: true, handle: "realaccount" });
+});
+
+// ---------------------------------------------------------------------------
 // Delete-response classification - the highest blast-radius surface in the tool.
 // ---------------------------------------------------------------------------
 
@@ -342,4 +399,75 @@ test("collectOwnTweets: does not blow up on null/primitive nodes", () => {
   assert.doesNotThrow(() => collectOwnTweets(null, "111", items, cursors));
   assert.doesNotThrow(() => collectOwnTweets("a string", "111", items, cursors));
   assert.doesNotThrow(() => collectOwnTweets(42, "111", items, cursors));
+});
+
+// ---------------------------------------------------------------------------
+// A long rate-limit wait must not look like a hang.
+//
+// A wait can be twenty minutes. One line followed by twenty minutes of silence is the one thing a
+// user watching an unattended overnight run cannot tell apart from a crash without killing it.
+// ---------------------------------------------------------------------------
+
+test("a long rate-limit wait keeps saying it is still waiting, and counts down", async (t) => {
+  const NOW = 1_700_000_000_000;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: NOW });
+  // A reset ten minutes out: one wait, long enough to be frightening.
+  const resetSeconds = Math.floor(NOW / 1000) + 600;
+  global.fetch = queuedFetch([
+    jsonResponse(429, { errors: [] }, { "x-rate-limit-reset": String(resetSeconds) }),
+    jsonResponse(200, { data: { delete_tweet: {} } }),
+  ]);
+  const { client, logger } = makeClient();
+
+  const resultPromise = client.deleteTweet("1");
+  await tickThrough(t, 12, 60 * 1000); // a minute at a time, as the clock really moves
+  const result = await resultPromise;
+
+  assert.deepEqual(result, { status: "deleted" });
+  assert.equal(logger.calls.warn.length, 1, "still exactly one warning about the rate limit");
+
+  const progress = logger.calls.info.filter((c) => /Still waiting out the rate limit/.test(c.msg));
+  assert.ok(progress.length >= 5, "a ten-minute wait must speak more than " + progress.length + " times");
+  const minutes = progress.map((c) => Number(c.msg.match(/about (\d+) minute/)[1]));
+  // Monotonically down: a countdown that does not count down is not evidence of progress.
+  for (let i = 1; i < minutes.length; i++) {
+    assert.ok(minutes[i] < minutes[i - 1], "countdown went " + minutes[i - 1] + " -> " + minutes[i]);
+  }
+  assert.ok(minutes[0] <= 10 && minutes[minutes.length - 1] >= 1);
+});
+
+test("a short rate-limit wait does not spam progress lines", async (t) => {
+  const NOW = 1_700_000_000_000;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: NOW });
+  const resetSeconds = Math.floor(NOW / 1000) + 40; // 45s once the buffer is added
+  global.fetch = queuedFetch([
+    jsonResponse(429, { errors: [] }, { "x-rate-limit-reset": String(resetSeconds) }),
+    jsonResponse(200, { data: { delete_tweet: {} } }),
+  ]);
+  const { client, logger } = makeClient();
+
+  const resultPromise = client.deleteTweet("1");
+  await tickThrough(t, 2, 60 * 1000);
+  await resultPromise;
+
+  assert.deepEqual(logger.calls.info.filter((c) => /Still waiting/.test(c.msg)), []);
+});
+
+test("the progress lines carry the same context as the warning, so a log says which tweet", async (t) => {
+  const NOW = 1_700_000_000_000;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: NOW });
+  const resetSeconds = Math.floor(NOW / 1000) + 600;
+  global.fetch = queuedFetch([
+    jsonResponse(429, { errors: [] }, { "x-rate-limit-reset": String(resetSeconds) }),
+    jsonResponse(200, { data: { delete_tweet: {} } }),
+  ]);
+  const { client, logger } = makeClient();
+
+  const resultPromise = client.deleteTweet("4242");
+  await tickThrough(t, 12, 60 * 1000);
+  await resultPromise;
+
+  const progress = logger.calls.info.filter((c) => /Still waiting/.test(c.msg));
+  assert.ok(progress.length > 0);
+  assert.deepEqual(progress[0].ctx, { tweetId: "4242" });
 });

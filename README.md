@@ -41,16 +41,18 @@ $ node bin/cli.js run
 
 [2026-09-06T18:09:19.586Z] === Pass 1 of 2: archive ===
 [2026-09-06T18:09:19.698Z] Archive loaded {"files":1,"tweets":4473,"alreadyHandled":0,"queued":4473}
-[2026-09-06T18:09:41.204Z] Progress 50/4473 {"deleted":50,"gone":0,"failed":0,"rate":140}
-[2026-09-06T18:10:49.305Z] Progress 200/4473 {"deleted":200,"gone":0,"failed":0,"rate":134}
+[2026-09-06T18:09:41.204Z] Progress 50/4473 {"deleted":50,"gone":0,"failed":0,"remaining":4423,"perMinute":140}
+[2026-09-06T18:10:49.305Z] Progress 200/4473 {"deleted":200,"gone":0,"failed":0,"remaining":4273,"perMinute":134}
 [2026-09-06T18:10:50.415Z] WARN Rate limited by X - waiting 694s: waiting for the rate-limit window X reported {"tweetId":"1326498712"}
-[2026-09-06T18:27:13.575Z] Progress 250/4473 {"deleted":250,"gone":0,"failed":0,"rate":14}
+[2026-09-06T18:19:12.033Z] Still waiting out the rate limit - about 8 minute(s) left before the next attempt
+[2026-09-06T18:27:13.575Z] Progress 250/4473 {"deleted":250,"gone":0,"failed":0,"remaining":4223,"perMinute":14}
 ...
 [2026-09-06T23:42:41.277Z] Archive pass complete {"deleted":4473,"gone":0,"failed":0}
 [2026-09-06T23:42:41.281Z] === Pass 2 of 2: timeline sweep ===
 [2026-09-06T23:42:41.402Z] Sweeping timelines {"operations":["UserRepliesTimeline","UserOriginalsTimeline","UserVideoTimeline"]}
 [2026-09-06T23:43:29.853Z] Round 1: found 116 post(s) still on your timelines
-[2026-09-06T23:56:36.558Z] Round 1 removed 116 {"deleted":116,"gone":0,"failed":0,"unretweeted":0}
+[2026-09-06T23:52:04.911Z] Round 1 progress 50/116 {"deleted":50,"gone":0,"failed":0,"unretweeted":0,"remaining":66,"perMinute":37}
+[2026-09-06T23:56:36.558Z] Round 1 deleted 116 {"deleted":116,"gone":0,"failed":0,"unretweeted":0}
 [2026-09-06T23:56:52.346Z] Round 2: found 0 post(s) still on your timelines
 
   CLEAN - a full pass over every timeline found nothing left.
@@ -165,8 +167,11 @@ node bin/cli.js verify
 | `verify` | Open your profile in a browser and prove it is empty |
 | `status` | Show session health, archive size and deletion progress |
 
-Every destructive command makes you type your handle back before it does anything, and every
-destructive command supports `--dry-run`.
+Every destructive command makes you type your handle back before it does anything — this is
+enforced at the deletion calls themselves, not just at the top of a command, so there is no code
+path that deletes a tweet without it — and every destructive command supports `--dry-run`. A
+`--limit`-ed run is deliberately incomplete: it prints `STOPPED EARLY` and exits non-zero rather
+than claiming to be done.
 
 **→ [Full CLI reference](docs/CLI.md)** — every flag, environment variable, exit code, and the
 troubleshooting list.
@@ -178,8 +183,20 @@ X's own rate limit — not something this tool imposes — allows roughly **200 
 took about five hours end to end, with zero failed deletions.
 
 The tool waits out rate limits on its own, honouring X's `x-rate-limit-reset` header when it
-points at a real future time and backing off exponentially when it doesn't. Long runs are meant to
-be left alone — see [running unattended](docs/CLI.md#resuming-and-running-unattended).
+points at a real future time and backing off exponentially when it doesn't. A wait longer than a
+minute prints roughly once a minute so it's never indistinguishable from a hang. Long runs are
+meant to be left alone — see [running unattended](docs/CLI.md#resuming-and-running-unattended).
+
+Progress lines report deletions left and a recent-window rate (`perMinute`, over the last five
+minutes) — deliberately **no ETA**. X's throttling is bimodal (full speed, then a wall of up to 20
+minutes), so any time-remaining estimate would be wrong by an order of magnitude exactly when
+someone stops to read it.
+
+If you're interrupted — Ctrl-C, closing the terminal, `kill`, a reboot — every tweet id already
+resolved is on disk before the process exits; re-running the same command picks up where it
+stopped. At most the single deletion that was in flight is unrecorded, and even that is harmless:
+X reports an already-deleted tweet as "not found" on retry. Only an unstoppable kill (`SIGKILL`, an
+OOM kill, power loss) can lose more, and even then it's at most the last few seconds.
 
 > [!TIP]
 > The post counter in your profile header is cached and can stay wrong for days. Judge progress by
@@ -202,6 +219,32 @@ user id, and the GraphQL request details the tool needs.
 - When you are done, revoke it from X's side: **Settings → Security and account access →
   Sessions**, and log out anything you don't want left alive.
 
+Full threat model, what's protected today, what to do if the file leaks, and how to report a real
+vulnerability privately: **[SECURITY.md](SECURITY.md)**.
+
+## Frequently asked
+
+**I have ~200,000 tweets. Will this even run?** Yes. The archive parser streams `tweets.js` a
+record at a time instead of loading it into memory, so archive size isn't a limit — see
+[How it works](docs/HOW-IT-WORKS.md#archive-parsing-srcarchivejs).
+
+**Can I delete only some tweets, not everything?** Not by content, date, or engagement — this tool
+has no filtering. What you *can* do: point `--archive` at your own JSON file containing just the
+id strings you want gone (`nuke` accepts a plain array of ids, not only a real archive export), or
+use `--limit` to stop a pass after N deletions and pick up manually later. There's no "keep the
+top N" or "delete tweets older than" mode.
+
+**What about likes, DMs, bookmarks, or pinned tweets?** Not supported. This tool only ever calls
+`DeleteTweet` and `UnretweetTweet` against your own posts and reposts, discovered from your archive
+and from your own profile timelines (Posts, Replies, Media, Highlights, Reposts). It never touches
+likes, direct messages, or bookmarks, and a pinned tweet is deleted like any other post — nothing
+un-pins it first, X just does that automatically when the tweet is gone.
+
+**Does this work on a protected (locked) account?** For emptying your own account, yes — you're
+authenticated as yourself, so your own protection setting doesn't hide your own timeline from you.
+It only matters for `verify --handle <someone-else>` against a protected account you don't follow:
+X won't show you that profile, and `verify` reports `COULD NOT CHECK` rather than guessing.
+
 ## Legal
 
 This project is not affiliated with, endorsed by, or connected to X Corp. It drives x.com's
@@ -213,10 +256,19 @@ response.
 ## Docs
 
 - [CLI reference](docs/CLI.md) — flags, environment variables, exit codes, troubleshooting
-- [How it works](docs/HOW-IT-WORKS.md) — session capture, GraphQL shapes, sweep loop, rate limits
+- [How it works](docs/HOW-IT-WORKS.md) — session capture, GraphQL shapes, sweep loop, rate limits,
+  the archive parser, and the confirmation gate
 - [Contributing](CONTRIBUTING.md) — where things live, how to run the tests (`npm test`, offline
-  and fast), and the one fix this project will always need when X renames its internal operations
-  again
+  and fast), CI, and the one fix this project will always need when X renames its internal
+  operations again
+- [Security policy](SECURITY.md) — the session-file threat model and how to report a real
+  vulnerability privately
+
+CI ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs the offline test suite on
+Node 20, 22 and latest across Ubuntu, macOS and Windows on every push and pull request. The tool
+itself has only actually been run against a real X account on Windows; macOS and Linux get the
+same test suite in CI but not yet a real-account run, so treat those two as "should work,
+untested against X" rather than verified.
 
 ## License
 

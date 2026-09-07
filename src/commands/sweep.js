@@ -8,10 +8,17 @@
  * while after a successful delete - so one empty-looking pass proves nothing. The sweep only
  * stops when a complete pass over every captured timeline finds no tweets at all.
  */
-const { createRunContext, requireHandle } = require("../context");
-const { loadState } = require("../state");
-const { confirmDestruction } = require("../confirm");
+const { createRunContext, resolveTargetHandle } = require("../context");
+const { loadState, applyDeleteResult } = require("../state");
+const { createRateWindow, PROGRESS_EVERY } = require("../logger");
+const { confirmDestruction, requireGate } = require("../confirm");
 const { UserError } = require("../errors");
+
+/**
+ * Consecutive pages with none of your posts on them before a timeline is considered walked. X
+ * interleaves pages that hold nothing of yours, so one is not enough.
+ */
+const EMPTY_PAGES_BEFORE_DONE = 3;
 
 const flags = {
   "--dry-run": "harvest and report what is still there, delete nothing",
@@ -24,6 +31,7 @@ const flags = {
 async function run(config, options = {}) {
   const ctx = options.ctx || createRunContext(config);
   const { logger, client, session } = ctx;
+  const gate = requireGate(ctx);
 
   const timelines = Object.entries(session.timelineUrls || {});
   if (timelines.length === 0) {
@@ -41,18 +49,24 @@ async function run(config, options = {}) {
   const summary = { deleted: 0, gone: 0, failed: 0, unretweeted: 0 };
 
   for (let round = 1; round <= config.maxRounds; round++) {
-    const { items, failedPages } = await harvest({ client, config, logger, timelines });
+    const { items, failedPages, cappedTimelines } = await harvest({ client, config, logger, timelines });
     logger.info("Round " + round + ": found " + items.length + " post(s) still on your timelines");
 
-    // A pass that could not read your timelines found nothing because it looked at nothing.
-    // Treating that as "clean" is how a tool reports success while every tweet is still there.
-    if (items.length === 0 && failedPages > 0) {
+    // A pass that could not read your timelines found nothing because it looked at nothing, and
+    // a pass that stopped paging at the page cap stopped looking before it ran out of timeline.
+    // Treating either as "clean" is how a tool reports success while every tweet is still there.
+    if (items.length === 0 && (failedPages > 0 || cappedTimelines.length > 0)) {
       logger.warn(
         "Round " +
           round +
           " found no posts, but " +
           failedPages +
-          " timeline request(s) failed - that is not proof your timelines are empty, so this pass does not count as clean."
+          " timeline request(s) failed and " +
+          cappedTimelines.length +
+          " timeline(s) stopped at the " +
+          config.maxTimelinePages +
+          "-page cap - that is not proof your timelines are empty, so this pass does not count as clean.",
+        { failedPages, cappedTimelines }
       );
       await client.sleep(5000);
       continue;
@@ -80,22 +94,40 @@ async function run(config, options = {}) {
       return 0;
     }
 
-    if (round === 1 && !options.alreadyConfirmed) {
+    // Asked once per run, and keyed on the gate rather than on the round number. `round === 1`
+    // was unreachable whenever round 1 ended in the `continue` above, which is exactly what a
+    // flaky timeline read produces - and the sweep then deleted the account unprompted.
+    if (!gate.armed) {
+      const target = await resolveTargetHandle(ctx);
       await confirmDestruction({
-        handle: await requireHandle(ctx),
+        handle: target.handle,
+        verified: target.verified,
+        userId: session.myUserId,
         action: "delete every post found on your timelines, repeating until none are left",
         count: items.length,
         assumeYes: config.assumeYes,
         logger,
+        gate,
       });
     }
 
-    let removedThisRound = 0;
+    let deletedThisRound = 0;
+    const rate = createRateWindow();
     try {
-      for (const item of items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
         if (config.limit > 0 && summary.deleted >= config.limit) {
-          logger.info("Reached --limit " + config.limit + ", stopping.");
-          return 0;
+          // Deliberately incomplete. Exiting 0 here told every caller - and the person reading
+          // the last line - that the account was empty when the sweep had just walked away from
+          // posts it could still see.
+          ctx.stoppedAtLimit = true;
+          logger.info("Reached --limit " + config.limit + ", stopping.", summary);
+          logger.plain("");
+          logger.plain("  STOPPED EARLY - --limit " + config.limit + " reached, and posts are still");
+          logger.plain("  on your timelines. This run was incomplete on purpose; nothing here says");
+          logger.plain("  your account is empty. Re-run without --limit to finish the job.");
+          logger.plain("");
+          return 1;
         }
 
         // A retweet only disappears once the retweet relationship is undone; the delete that
@@ -108,27 +140,33 @@ async function run(config, options = {}) {
         }
 
         const result = await client.deleteTweet(item.id);
-        if (result.status === "deleted") {
-          state.markDeleted(item.id);
-          summary.deleted++;
-          removedThisRound++;
-        } else if (result.status === "gone") {
-          state.markGone(item.id);
-          summary.gone++;
-        } else {
-          state.markFailed(item.id, result.message, result.http);
-          summary.failed++;
+        const recorded = applyDeleteResult(state, item.id, result, summary);
+        if (recorded === "deleted") deletedThisRound++;
+        if (recorded === "failed") {
           logger.warn("Delete failed", { id: item.id, http: result.http, message: result.message });
+        } else {
+          rate.record();
         }
 
         state.saveThrottled();
+        // The deletion loop used to say nothing at all until the round ended - thirteen silent
+        // minutes in a real transcript, indistinguishable from a hang. `nuke` reports every
+        // PROGRESS_EVERY ids; so does this.
+        if ((i + 1) % PROGRESS_EVERY === 0) {
+          logger.info("Round " + round + " progress " + (i + 1) + "/" + items.length, {
+            ...summary,
+            remaining: items.length - (i + 1),
+            // Recent-window, not a lifetime average, and no ETA. See createRateWindow.
+            perMinute: rate.perMinute(),
+          });
+        }
         if (config.delayMs > 0) await client.sleep(config.delayMs);
       }
     } finally {
       state.save();
     }
 
-    logger.info("Round " + round + " removed " + removedThisRound, summary);
+    logger.info("Round " + round + " deleted " + deletedThisRound, summary);
   }
 
   logger.warn("Stopped after " + config.maxRounds + " rounds without a clean pass", summary);
@@ -141,20 +179,53 @@ async function run(config, options = {}) {
 }
 
 /**
- * Page every captured timeline once and return the account's own posts, de-duplicated, together
- * with the number of pages that could not be read at all.
+ * Page every captured timeline once and return the account's own posts, de-duplicated.
+ *
+ * Exported because this is where the sweep decides whether an empty-looking result means "there
+ * is nothing left" or "I could not finish looking", and that decision is the difference between
+ * a true CLEAN and telling somebody their account is empty while it is not. Both ways of not
+ * finishing are reported, and both are treated by `run` exactly alike:
+ *
+ *  - `failedPages`: pages X refused or answered with something unreadable.
+ *  - `cappedTimelines`: timelines that were still paginating when they hit maxTimelinePages.
+ *    Hitting that cap used to be invisible - not logged, not counted - and so was indistinguish-
+ *    able from having reached the end of a timeline, which is the same "stopped looking" versus
+ *    "nothing left" confusion in a different place.
+ *
+ * @returns {Promise<{items: object[], failedPages: number, cappedTimelines: string[]}>}
  */
 async function harvest({ client, config, logger, timelines }) {
   const all = new Map();
   let failedPages = 0;
+  const cappedTimelines = [];
 
   for (const [name, templateUrl] of timelines) {
     let cursor = null;
     let emptyPages = 0;
+    let pages = 0;
 
-    for (let page = 0; page < config.maxTimelinePages && emptyPages < 3; page++) {
+    for (;;) {
+      if (pages >= config.maxTimelinePages) {
+        cappedTimelines.push(name);
+        logger.warn(
+          "Stopped paging " +
+            name +
+            " at the " +
+            config.maxTimelinePages +
+            "-page cap while it was still handing out cursors. This pass did not reach the end of " +
+            "that timeline, so it cannot count as a clean one; the next round picks it up from the top.",
+          { timeline: name, pages, postsSoFar: all.size }
+        );
+        break;
+      }
+      if (emptyPages >= EMPTY_PAGES_BEFORE_DONE) break;
+
       const result = await client.fetchTimelinePage(templateUrl, cursor);
-      if (result === null) continue; // rate limited; the client already waited, retry this cursor
+      // Rate limited: the client has already waited, and this cursor has not been read yet. It
+      // must not count against the page budget - retrying a cursor is not progress through the
+      // timeline, and charging it burned pages the sweep needed to reach the end.
+      if (result === null) continue;
+      pages++;
       if (result.failed) failedPages++;
 
       for (const [id, item] of result.items) all.set(id, item);
@@ -168,14 +239,16 @@ async function harvest({ client, config, logger, timelines }) {
       cursor = nextCursor;
       if (config.timelinePageDelayMs > 0) await client.sleep(config.timelinePageDelayMs);
     }
-    logger.debug("Harvested " + name, { totalSoFar: all.size, failedPages });
+    logger.debug("Harvested " + name, { pages, totalSoFar: all.size, failedPages });
   }
 
-  return { items: Array.from(all.values()), failedPages };
+  return { items: Array.from(all.values()), failedPages, cappedTimelines };
 }
 
 module.exports = {
   run,
+  harvest,
   flags,
+  EMPTY_PAGES_BEFORE_DONE,
   description: "Page your timelines and delete whatever is left, until a pass finds nothing",
 };

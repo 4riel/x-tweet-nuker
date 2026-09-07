@@ -16,6 +16,7 @@ const {
   classifyTab,
   sessionCookies,
   EMPTY_STATE,
+  UNAVAILABLE_STATE,
   MISSING_POST,
   LOAD_FAILURE,
 } = require("../src/commands/verify");
@@ -65,8 +66,7 @@ test("EMPTY_STATE matches X's real empty-timeline phrasing", () => {
     "@someone hasn't highlighted",
     "@someone hasn't replied",
     "No posts yet",
-    "These posts are protected",
-    "@someone's account doesn't exist",
+    "Nothing to see here",
   ]) {
     assert.ok(EMPTY_STATE.test(text), `expected match: ${text}`);
   }
@@ -74,6 +74,24 @@ test("EMPTY_STATE matches X's real empty-timeline phrasing", () => {
 
 test("EMPTY_STATE does not match ordinary rendered-content text", () => {
   assert.equal(EMPTY_STATE.test("Home / Explore / Notifications / Messages"), false);
+});
+
+test("EMPTY_STATE does not match a hidden profile - suspended/protected/missing is not empty", () => {
+  for (const text of [
+    "Account suspended X suspends accounts that violate the X Rules",
+    "This account is suspended",
+    "These posts are protected",
+    "@someone's account doesn't exist",
+    "This account owner limits who can view their posts",
+  ]) {
+    assert.equal(EMPTY_STATE.test(text), false, `must not read as empty: ${text}`);
+    assert.ok(UNAVAILABLE_STATE.test(text), `expected unavailable: ${text}`);
+  }
+});
+
+test("UNAVAILABLE_STATE does not match an ordinary empty timeline", () => {
+  assert.equal(UNAVAILABLE_STATE.test("@someone hasn't posted"), false);
+  assert.equal(UNAVAILABLE_STATE.test("No posts yet"), false);
 });
 
 test("LOAD_FAILURE matches X's error-page phrasing", () => {
@@ -290,6 +308,35 @@ test("classifyTab: own posts, reposts and bare article cards each make a tab sti
   assert.equal(classifyTab(tab({ repostedStatusLinks: 1 })), "stillThere");
   assert.equal(classifyTab(tab({ articles: 1 })), "stillThere");
   assert.equal(classifyTab(tab({ timelineRendered: true, timelineArticles: 3 })), "stillThere");
+});
+
+test("classifyTab: a suspended account is 'unavailable', never confirmedEmpty", () => {
+  // A suspended account renders nothing at all - structurally identical to an emptied one - and
+  // still holds every post it ever made. Reporting CLEAN here is the worst answer available.
+  const suspended = tab({ text: "Account suspended X suspends accounts that violate the X Rules" });
+  assert.equal(classifyTab(suspended), "unavailable");
+  // Even with X's own empty-state container on the page, suspension wins.
+  assert.equal(classifyTab({ ...suspended, emptyStateMarker: true }), "unavailable");
+  assert.equal(
+    classifyTab({ ...suspended, timelineRendered: true, timelineArticles: 0 }),
+    "unavailable"
+  );
+});
+
+test("classifyTab: protected posts and a non-existent account are 'unavailable' too", () => {
+  assert.equal(classifyTab(tab({ text: "These posts are protected" })), "unavailable");
+  assert.equal(classifyTab(tab({ text: "This account doesn't exist" })), "unavailable");
+  assert.equal(
+    classifyTab(tab({ text: "This account owner limits who can view their posts" })),
+    "unavailable"
+  );
+});
+
+test("classifyTab: posts still rendered outrank an unavailable message (stillThere wins)", () => {
+  assert.equal(
+    classifyTab(tab({ articles: 2, text: "These posts are protected" })),
+    "stillThere"
+  );
 });
 
 test("classifyTab: content inside a timeline region beats that region's own empty-state marker", () => {

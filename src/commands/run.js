@@ -5,9 +5,9 @@
  * leaves the sweep - the slow part, because it has to page timelines - with very little to do.
  * If there is no archive the command just goes straight to the sweep.
  */
-const { createRunContext, requireHandle } = require("../context");
+const { createRunContext, resolveTargetHandle } = require("../context");
 const { readArchiveIds } = require("../archive");
-const { confirmDestruction } = require("../confirm");
+const { confirmDestruction, requireGate } = require("../confirm");
 const nuke = require("./nuke");
 const sweep = require("./sweep");
 
@@ -23,6 +23,7 @@ const flags = {
 async function run(config) {
   const ctx = createRunContext(config);
   const { logger } = ctx;
+  const gate = requireGate(ctx);
 
   const archive = readArchiveIds(config.archivePath);
   if (archive.total === 0) {
@@ -31,8 +32,11 @@ async function run(config) {
   }
 
   if (!config.dryRun) {
+    const target = await resolveTargetHandle(ctx);
     await confirmDestruction({
-      handle: await requireHandle(ctx),
+      handle: target.handle,
+      verified: target.verified,
+      userId: ctx.session.myUserId,
       action:
         archive.total > 0
           ? "delete your entire archive (" + archive.total + " tweets), then sweep your timelines until empty"
@@ -40,10 +44,13 @@ async function run(config) {
       count: null,
       assumeYes: config.assumeYes,
       logger,
+      gate,
     });
   }
 
-  const passOptions = { ctx, alreadyConfirmed: true };
+  // The armed gate is what stops the two passes asking again; it is also what lets them delete
+  // at all, so a dry run leaves it disarmed and both passes stay structurally unable to destroy.
+  const passOptions = { ctx };
 
   let archiveCode = 0;
   if (archive.total > 0) {
@@ -57,6 +64,11 @@ async function run(config) {
   logger.plain("");
   if (config.dryRun) {
     logger.plain("  Dry run finished - nothing was deleted. Re-run without --dry-run to delete.");
+  } else if (ctx.stoppedAtLimit) {
+    // "Done." after --limit was a lie: the run stopped on purpose with tweets still there.
+    logger.plain("  NOT finished - this run stopped early at --limit " + config.limit + ", as asked.");
+    logger.plain("  Tweets are still on your account. Re-run without --limit to finish, then");
+    logger.plain("  confirm with `x-tweet-nuker verify`.");
   } else if (sweepCode !== 0) {
     logger.plain("  NOT finished - the sweep stopped before a clean pass. Run `x-tweet-nuker sweep`");
     logger.plain("  again in a few minutes, then confirm with `x-tweet-nuker verify`.");

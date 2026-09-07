@@ -1,0 +1,118 @@
+name: Bug report
+description: Something in x-tweet-nuker isn't working right.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Before you paste anything below: never include your session file
+        (`.x-session-data.json`), `.env`, or any cookie/token value in this issue.** Those are
+        equivalent to your X login — pasting one here leaks your account to the entire internet,
+        since this repo is public. This form only asks for the *operation names* seen, never the
+        request contents. If you've already pasted a credential anywhere, revoke it immediately
+        at x.com → Settings → Security and account access → Sessions, then edit or delete the
+        comment.
+
+        If the issue is "commands fail with 401/403" or "no timeline requests captured", check
+        the [troubleshooting section](https://github.com/4riel/x-tweet-nuker/blob/main/docs/CLI.md#troubleshooting)
+        first — X renaming its internal GraphQL operations is the single most common cause, and
+        the fix is usually a one-line change to `KNOWN_TIMELINE_OPS` in `src/session.js`.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, what actually happened, and the command that triggered it.
+      placeholder: |
+        Ran `x-tweet-nuker sweep --yes` and it exited immediately saying "no timeline requests captured".
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Exact command run
+      description: Include flags, but strip any path or value you'd rather not share.
+      placeholder: x-tweet-nuker run --yes --data-dir ./data
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      description: >
+        Paste the relevant lines from the console output or the log file (default
+        `x-tweet-nuker.log`, or the path passed to `--log`). Run with `--verbose` first if the
+        default output isn't detailed enough. Do not paste the whole log if it's long — the part
+        around the error is enough.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      description: Output of `node --version`.
+      placeholder: v20.11.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: Windows 11 23H2 / macOS 15.1 / Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fresh-session
+    attributes:
+      label: Was the session freshly captured?
+      description: Did you run `login` again right before hitting this, or are you reusing an older session file?
+      options:
+        - "Yes — ran `login` right before this happened"
+        - "No — reused a session captured earlier"
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: graphql-operations-seen
+    attributes:
+      label: graphqlOperationsSeen (only if a timeline/sweep problem)
+      description: >
+        Only relevant if timelines aren't being captured or swept correctly. Open your session
+        file (default `.x-session-data.json`) and copy the `graphqlOperationsSeen` array —
+        **operation names only, e.g. `["UserByScreenName", "UserOriginalsTimeline", ...]`. Do
+        NOT copy `cookieHeader`, `ct0`, `queryIds`, or `timelineUrls` from that file — those are
+        credentials.** If you're not sure a value is safe to paste, leave it out and describe it
+        instead.
+      render: json
+      placeholder: '["UserByScreenName", "UserOriginalsTimeline", "UserRepliesTimeline", "..."]'
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — archive size, account age, whether this worked before, etc.
+    validations:
+      required: false

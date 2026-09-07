@@ -196,3 +196,156 @@ test("sweep --max-rounds 0 is rejected before anything runs, not silently defaul
   assert.match(r.stderr, /Invalid value for --max-rounds/);
   assert.match(r.stderr, /1 or more/);
 });
+
+// ---------------------------------------------------------------------------
+// The third place a flag has to be registered.
+//
+// A flag lives in three tables: the parser's known-flag sets in bin/cli.js, the command's own
+// `flags` help map, and src/config.js, which is the only one that makes it do anything. The two
+// tests above tie the first two together; without this one, a new flag on a destructive command
+// can parse cleanly, be advertised in --help, be accepted on the command line - and be silently
+// ignored, which on this tool means a `--limit` that does not limit.
+// ---------------------------------------------------------------------------
+
+const { buildConfig } = require("../src/config");
+
+/**
+ * Flags the CLI answers by itself, before any config exists. These genuinely have nothing to do
+ * with buildConfig, and the list is asserted below so it cannot quietly grow.
+ */
+const CLI_ONLY_FLAGS = ["help", "h", "version"];
+
+/** A value each value-flag can be given that is valid and different from the default. */
+const PROBE_VALUES = {
+  "data-dir": null, // filled in per-case: it must be a real, distinct directory
+  session: "probe-session.json",
+  state: "probe-state.json",
+  log: "probe.log",
+  archive: "probe-tweets.js",
+  handle: "probehandle",
+  "chrome-executable": "/probe/chrome",
+  delay: "1234",
+  limit: "7",
+  "max-rounds": "9",
+  ids: "101,102",
+};
+
+function configWith(flags) {
+  return JSON.stringify(buildConfig(flags, {}));
+}
+
+test("every value flag the parser accepts actually reaches the configuration", () => {
+  const base = tmpDir();
+  const baseline = configWith({ "data-dir": base });
+  const ignored = [];
+  for (const name of cli.VALUE_FLAGS) {
+    const probe = name === "data-dir" ? tmpDir() : PROBE_VALUES[name];
+    assert.ok(probe, "no probe value defined for --" + name + " - add one to PROBE_VALUES");
+    const withFlag = configWith({ "data-dir": base, [name]: probe });
+    if (withFlag === baseline) ignored.push("--" + name);
+  }
+  assert.deepEqual(ignored, [], "parsed and documented, but ignored by src/config.js: " + ignored.join(", "));
+});
+
+test("every boolean flag the parser accepts either reaches the configuration or is CLI-only", () => {
+  const base = tmpDir();
+  const baseline = configWith({ "data-dir": base });
+  const ignored = [];
+  for (const name of cli.BOOLEAN_FLAGS) {
+    if (CLI_ONLY_FLAGS.includes(name)) continue;
+    if (configWith({ "data-dir": base, [name]: true }) === baseline) ignored.push("--" + name);
+  }
+  assert.deepEqual(ignored, [], "parsed and documented, but ignored by src/config.js: " + ignored.join(", "));
+});
+
+test("the list of flags exempt from the config check is exactly the ones the CLI answers itself", () => {
+  // Each of these must short-circuit in bin/cli.js before a command ever runs; if one stops doing
+  // that, it belongs in the config check above rather than in the exemption list.
+  assert.deepEqual([...CLI_ONLY_FLAGS].sort(), ["h", "help", "version"]);
+  assert.equal(run(["--version"]).status, 0);
+  assert.equal(run(["--help"]).status, 0);
+  assert.equal(run(["-h"]).status, 0);
+});
+
+test("help's own arity notation matches how the parser treats each flag", () => {
+  // The help maps already encode arity: "--limit <n>" takes a value, "--dry-run" does not. That
+  // is derivable, so a flag documented as taking a value while the parser treats it as a boolean
+  // (or the reverse) is caught here rather than by a user typing it.
+  const specs = [
+    ...Object.keys(cli.GLOBAL_FLAGS),
+    ...Object.values(cli.COMMANDS).flatMap((command) => Object.keys(command.flags || {})),
+  ];
+  for (const spec of specs) {
+    const takesValue = /<[^>]+>/.test(spec);
+    for (const token of flagTokens(spec)) {
+      const name = token.replace(/^--?/, "");
+      const expected = takesValue ? cli.VALUE_FLAGS : cli.BOOLEAN_FLAGS;
+      assert.ok(
+        expected.has(name),
+        spec + " is documented as " + (takesValue ? "taking a value" : "a boolean") + ", but the parser disagrees"
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Long hints are wrapped. This tool's hints are long on purpose - they explain what to do next
+// about something irreversible - and they used to print as one 300-character line.
+// ---------------------------------------------------------------------------
+
+test("wrapText breaks on whitespace and keeps every word", () => {
+  const text = "one two three four five six seven eight nine ten";
+  const wrapped = cli.wrapText(text, 20);
+  for (const line of wrapped.split("\n")) assert.ok(line.length <= 20, "too long: " + line);
+  assert.equal(wrapped.split("\n").join(" "), text);
+});
+
+test("wrapText indents every line it produces, not just the first", () => {
+  const wrapped = cli.wrapText("alpha bravo charlie delta echo foxtrot", 20, "  ");
+  const lines = wrapped.split("\n");
+  assert.ok(lines.length > 1);
+  for (const line of lines) {
+    assert.match(line, /^ {2}\S/);
+    assert.ok(line.length <= 20, "too long: " + line);
+  }
+});
+
+test("wrapText leaves an unbreakable token (a path, a URL) intact rather than splitting it", () => {
+  const url = "https://github.com/4riel/x-tweet-nuker/issues/very/long/path/that/exceeds/the/width";
+  const wrapped = cli.wrapText("Report it at " + url + " please", 40);
+  assert.ok(wrapped.includes(url), "a URL broken across lines cannot be copied");
+});
+
+test("wrapText preserves deliberate line breaks", () => {
+  assert.equal(cli.wrapText("one\ntwo", 40), "one\ntwo");
+});
+
+test("a long UserError hint is wrapped to a readable width on the way out of the CLI", () => {
+  // `nuke` with a session file but no archive: it fails on the archive check, which carries one of
+  // the longest hints in the tool, and it does so before anything touches the network.
+  const dataDir = tmpDir();
+  fs.writeFileSync(
+    path.join(dataDir, ".x-session-data.json"),
+    JSON.stringify({
+      handle: "someone",
+      myUserId: "111",
+      cookieHeader: "auth_token=x; ct0=y",
+      ct0: "y",
+      queryIds: { DeleteTweet: "q" },
+      timelineUrls: {},
+      savedAt: new Date().toISOString(),
+    })
+  );
+
+  const r = run(["nuke", "--data-dir", dataDir]);
+  assert.equal(r.status, 1);
+
+  const lines = r.stderr.split(/\r?\n/);
+  const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  assert.ok(longest <= 80, "a hint line was " + longest + " characters wide: " + r.stderr);
+  assert.ok(lines.length > 4, "the hint must actually be spread over several lines");
+  // Wrapping must not have eaten or mangled the advice itself.
+  const flat = r.stderr.replace(/\s+/g, " ");
+  assert.match(flat, /Download your archive from X/);
+  assert.match(flat, /run `x-tweet-nuker sweep` instead/);
+});

@@ -52,7 +52,9 @@ async function run(config) {
   add("Archive tweets", archive.total > 0 ? String(archive.total) : "none found");
 
   if (fs.existsSync(config.stateFile)) {
-    const state = loadState(config.stateFile);
+    // With the logger, so an unreadable state file is reported here too rather than showing up
+    // as a suspiciously fresh "0 deleted" on the account someone spent all night emptying.
+    const state = loadState(config.stateFile, { logger });
     const counts = state.counts();
     add("Deleted so far", String(counts.deleted));
     add("Already gone", String(counts.gone));

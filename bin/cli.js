@@ -63,6 +63,49 @@ const GLOBAL_FLAGS = {
 /** Width the flag column is padded to in help output; the longest flag string sets it. */
 const FLAG_COLUMN = 28;
 
+/** Fallback line width when the terminal will not say how wide it is. */
+const DEFAULT_WIDTH = 80;
+
+/**
+ * Wrap an error message or hint to the terminal width.
+ *
+ * The hints in this tool are long on purpose - they explain what to do next about something
+ * irreversible - and every one of them used to print as a single 300-character line that the
+ * terminal broke wherever it liked, mid-word, in a tool that is otherwise careful about how it
+ * reads. Only whitespace is touched: a path, a URL or a command longer than the width is left on
+ * its own line intact rather than broken somewhere that would make it uncopyable.
+ *
+ * @param {string} text
+ * @param {number} width total line width including the indent
+ * @param {string} [indent] prefix for every line produced
+ */
+function wrapText(text, width, indent = "") {
+  // The indent is part of the line, so it comes out of the budget; the floor is only there to
+  // stop an absurd width producing one word per line.
+  const limit = Math.max(10, Math.max(20, width) - indent.length);
+  const lines = [];
+  for (const paragraph of String(text).split("\n")) {
+    let current = "";
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      if (current === "") current = word;
+      else if (current.length + 1 + word.length <= limit) current += " " + word;
+      else {
+        lines.push(indent + current);
+        current = word;
+      }
+    }
+    lines.push(indent + current);
+  }
+  return lines.join("\n");
+}
+
+/** The terminal's width, clamped to something readable when it is absurd or unknown. */
+function outputWidth(stream) {
+  const columns = stream && stream.columns;
+  if (!Number.isInteger(columns) || columns <= 0) return DEFAULT_WIDTH;
+  return Math.max(50, Math.min(100, columns));
+}
+
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
@@ -215,9 +258,10 @@ function cli(argv) {
     })
     .catch((error) => {
       if (error instanceof UserError) {
+        const width = outputWidth(process.stderr);
         console.error("");
-        console.error("  " + error.message);
-        if (error.hint) console.error("  " + error.hint);
+        console.error(wrapText(error.message, width, "  "));
+        if (error.hint) console.error(wrapText(error.hint, width, "  "));
         console.error("");
         process.exitCode = error.exitCode || 1;
         return;
@@ -234,4 +278,13 @@ function cli(argv) {
 // the parser accepts and the flags help advertises are the same set) must not execute a command.
 if (require.main === module) cli(process.argv.slice(2));
 
-module.exports = { cli, parseArgs, helpText, COMMANDS, GLOBAL_FLAGS, VALUE_FLAGS, BOOLEAN_FLAGS };
+module.exports = {
+  cli,
+  parseArgs,
+  helpText,
+  wrapText,
+  COMMANDS,
+  GLOBAL_FLAGS,
+  VALUE_FLAGS,
+  BOOLEAN_FLAGS,
+};
