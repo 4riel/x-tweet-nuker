@@ -1,0 +1,3 @@
+# One line ending in the repository: LF. Git still checks out CRLF for anyone who wants it,
+# but the tree stays consistent no matter which platform a contributor is on.
+* text=auto eol=lf

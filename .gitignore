@@ -1,0 +1,26 @@
+node_modules/
+
+# Secrets and captured session state - never commit these
+.env
+.x-session-data.json
+.x-session.json
+.x-cookies.json
+
+# Run state and logs (plus the tool's lock, temp and corrupt-backup siblings)
+.nuke-state.json
+.nuke-state.json.*
+progress.json
+*.log
+*.out
+*.err
+
+# Personal Twitter/X archive data
+tweets.js
+tweets-part*.js
+twitter data/
+*.zip
+
+# Browser profiles created by the login command
+.chrome-user-data/
+.chrome-probe/
+.chrome-runtime/

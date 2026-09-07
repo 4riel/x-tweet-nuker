@@ -1,0 +1,47 @@
+{
+  "name": "x-tweet-nuker",
+  "version": "1.0.0",
+  "description": "Delete every tweet from your X (Twitter) account by driving x.com's own web API with your logged-in browser session.",
+  "bin": {
+    "x-tweet-nuker": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "twitter",
+    "x",
+    "tweet",
+    "delete",
+    "bulk-delete",
+    "archive",
+    "cli",
+    "privacy",
+    "playwright"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4riel/x-tweet-nuker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/4riel/x-tweet-nuker/issues"
+  },
+  "homepage": "https://github.com/4riel/x-tweet-nuker#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    ".env.example",
+    "LICENSE",
+    "README.md",
+    "CONTRIBUTING.md"
+  ],
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
