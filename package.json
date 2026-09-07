@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node bin/cli.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/archive.test.js test/cli.test.js test/client.test.js test/commands.test.js test/config.test.js test/confirm.test.js test/context.test.js test/harvest.test.js test/logger.test.js test/session.test.js test/state.test.js test/verify.test.js"
   },
   "keywords": [
     "twitter",

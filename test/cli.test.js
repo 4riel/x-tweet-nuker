@@ -349,3 +349,25 @@ test("a long UserError hint is wrapped to a readable width on the way out of the
   assert.match(flat, /Download your archive from X/);
   assert.match(flat, /run `x-tweet-nuker sweep` instead/);
 });
+
+// The npm test script lists every test file explicitly rather than using a glob: Node's own glob
+// support in --test landed after Node 20, and Windows shells do not expand globs themselves, so
+// `test/*.test.js` silently ran zero files on Windows + Node 20. An explicit list works on every
+// shell and every supported Node, but it can drift the moment someone adds a test file - and a
+// test file that is never run is worse than no test at all, because it looks like coverage.
+test("the npm test script runs every test file in test/", () => {
+  const fs = require("fs");
+  const pkgPath = path.join(__dirname, "..", "package.json");
+  const script = JSON.parse(fs.readFileSync(pkgPath, "utf8")).scripts.test;
+  const onDisk = fs
+    .readdirSync(__dirname)
+    .filter((f) => f.endsWith(".test.js"))
+    .sort();
+
+  const missing = onDisk.filter((f) => !script.includes("test/" + f));
+  assert.deepStrictEqual(missing, [], "test files not listed in package.json scripts.test");
+
+  const listed = script.match(/test\/[\w.-]+\.test\.js/g) || [];
+  const stale = listed.filter((p) => !fs.existsSync(path.join(__dirname, "..", p)));
+  assert.deepStrictEqual(stale, [], "scripts.test lists files that no longer exist");
+});

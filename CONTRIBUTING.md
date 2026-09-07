@@ -23,7 +23,7 @@ The package is not on npm, so `npx x-tweet-nuker` will not work. If you want the
 There is a test suite, and it is fast and offline:
 
 ```bash
-npm test        # node --test test/*.test.js
+npm test        # Node's built-in runner, over every test/*.test.js
 ```
 
 ## Continuous integration
@@ -87,8 +87,16 @@ public issue.
 ## Testing a change
 
 `npm test` runs the whole suite with Node's built-in test runner — no framework, no network, no
-browser, no real X account, and nothing written outside `os.tmpdir()`. The suite's own test names
-are a good index of what behavior is actually guaranteed; broadly, it covers:
+browser, no real X account, and nothing written outside `os.tmpdir()`.
+
+If you add a test file, add it to `scripts.test` in `package.json` too. The script lists every file
+explicitly instead of using a glob, because Node's own glob support in `--test` arrived after Node
+20 and Windows shells don't expand globs themselves — so `test/*.test.js` quietly ran nothing at
+all on Windows + Node 20. A test in `test/cli.test.js` fails if the list and the directory ever
+disagree, so you will be told rather than shipping a test file nobody runs.
+
+The suite's own test names are a good index of what behavior is actually guaranteed; broadly, it
+covers:
 
 - argument parsing and help/parser agreement (`test/cli.test.js`)
 - configuration precedence and numeric validation (`test/config.test.js`)
